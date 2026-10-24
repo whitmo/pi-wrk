@@ -27,6 +27,11 @@ test('routing selectors and leading lifetime flag select distinct jobs', () => {
   assert.deepEqual(parseRequest('fix', { alias: 'wrk' }), expected('router', 'fix'));
 });
 
+test('explicit agent selection keeps keyword-prefixed prompt opaque for bg', () => {
+  assert.deepEqual(parseRequest('a:{name: ari} council assess', { alias: 'bg' }),
+    expected('agent', 'council assess', { name: 'ari' }));
+});
+
 test('only bare background commands request handoff', () => {
   assert.deepEqual(parseRequest('   '), expected('agent', '', {}, null, 'session', true));
   assert.deepEqual(parseRequest('', { alias: 'bg' }), expected('agent', '', {}, null, 'session', true));

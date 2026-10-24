@@ -51,6 +51,24 @@ test('updates are atomic replacements and may not alter immutable identity field
   assert.equal(getJob(dir, a.id).status, 'running');
 });
 
+test('handoff readiness changes without replacing immutable request or identity', t => {
+  const { dir, input } = fixture(t);
+  const job = admitJob(dir, { ...input, handoff: { ready: false, reason: 'settling' } });
+  const changed = updateJob(dir, job.id, { handoff: { ready: true } });
+  assert.equal(changed.handoff.ready, true);
+  assert.deepEqual(changed.request, job.request);
+  assert.equal(changed.status, 'queued');
+});
+
+test('child admission preserves and validates immutable parent identity', t => {
+  const { dir, input } = fixture(t);
+  const parent = admitJob(dir, input);
+  const child = admitJob(dir, { ...input, parentId: parent.id });
+  assert.equal(getJob(dir, child.id).parentId, parent.id);
+  assert.throws(() => admitJob(dir, { ...input, parentId: '../escape' }), /id|uuid/i);
+  assert.throws(() => updateJob(dir, child.id, { parentId: child.id }), /immutable/i);
+});
+
 test('invalid paths, missing and corrupt job entries cannot be trusted', t => {
   const { dir, input } = fixture(t);
   const a = admitJob(dir, input);
