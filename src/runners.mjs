@@ -99,7 +99,11 @@ export function createRunners({ piCommand = 'pi', definitions, availableModels, 
     if (env) args.push('--extension', fileURLToPath(new URL('../extensions/runner-messages.ts', import.meta.url)),
       '--append-system-prompt', 'Use wrk_message for concise questions, blockers, guidance or results for the submitting session. A stored message does not imply a reply.');
     const tools = options.tools ?? selected?.tools;
-    if (tools) args.push('--tools', Array.isArray(tools) ? tools.join(',') : tools);
+    if (tools) {
+      const enabled = Array.isArray(tools) ? [...tools] : tools.split(',').map(name => name.trim());
+      if (env && !enabled.includes('wrk_message')) enabled.push('wrk_message');
+      args.push('--tools', enabled.join(','));
+    }
     if (model) args.push('--model', model);
     if (selected?.prompt) args.push('--system-prompt', selected.prompt);
     if (options.systemInstruction) args.push('--append-system-prompt', options.systemInstruction);

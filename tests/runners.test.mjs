@@ -52,11 +52,12 @@ test('agent explicitly loads only trusted message tool and passes scoped executi
     ].join('\n') };
   };
   const context = { ...ctx(), storeDir: '/tmp/wrk-private' };
-  await createRunners({ invoke }).agent(job('agent', 'exact task'), context);
+  await createRunners({ invoke }).agent(job('agent', 'exact task', { tools: 'read,grep,find,ls' }), context);
   assert.ok(call.args.includes('--no-extensions'));
   assert.match(call.args[call.args.indexOf('--extension') + 1], /extensions\/runner-messages\.ts$/);
   assert.equal(call.config.env.PI_WRK_STORE, context.storeDir);
   assert.equal(call.config.env.PI_WRK_JOB_ID, 'job');
+  assert.deepEqual(call.args[call.args.indexOf('--tools') + 1].split(','), ['read', 'grep', 'find', 'ls', 'wrk_message']);
   assert.equal(call.args.at(-1), 'exact task');
 });
 
