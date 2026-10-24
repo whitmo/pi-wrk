@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync, utimesSync, existsSync, readFileSync } from 'node:fs';
 import { admitJob, getJob, readJobOutput, requestCancel, touchOwner } from '../src/store.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -34,8 +34,8 @@ async function running(f, runners, options = {}) {
   return { stop: async () => { stop.abort(); await work; } };
 }
 
-async function until(predicate) {
-  for (let n = 0; n < 100; n++) {
+async function until(predicate, timeoutMs = 500) {
+  for (let n = 0; n < timeoutMs / 5; n++) {
     if (predicate()) return;
     await new Promise(resolve => setTimeout(resolve, 5));
   }
@@ -80,12 +80,15 @@ test('cancel running job aborts it and records cancelled only after termination'
   } finally { await worker.stop(); }
 });
 
-test('restart marks uncertain active job interrupted, never reruns it', async () => {
+test('restart holds unknown active mutation and prevents newly queued work', async () => {
   const f = fixture([{ id: 'unknown', status: 'running' }]);
   let calls = 0;
   const worker = await running(f, { agent: async () => { calls++; return {}; } });
   try {
-    await until(() => f.items.get('unknown').status === 'interrupted');
+    await until(() => f.items.get('unknown').status === 'uncertain');
+    f.items.set('new', { id: 'new', status: 'queued', ownerId: 'owner', request: { runner: 'agent', prompt: 'new', lifetime: 'independent' } });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(f.items.get('new').status, 'queued');
     assert.equal(calls, 0);
   } finally { await worker.stop(); }
 });
@@ -155,9 +158,53 @@ test('real store shell job records output, exit and cancellation', async () => {
     assert.equal(readJobOutput(dir, first.id), 'done');
     await until(() => getJob(dir, second.id).status === 'running');
     requestCancel(dir, second.id);
-    await until(() => getJob(dir, second.id).status === 'cancelled');
+    await until(() => getJob(dir, second.id).status === 'uncertain');
+    assert.match(getJob(dir, second.id).error, /termination unverified/);
+    const pending = admitJob(dir, { ownerId, projectRoot: dir, cwd: dir, request: { runner: 'shell', prompt: '', options: { command: 'printf unsafe' }, lifetime: 'independent', queue: null } });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(getJob(dir, pending.id).status, 'queued');
     assert.equal(getJob(dir, first.id).summary, 'shell exited 0');
   } finally { controller.abort(); await running; rmSync(temp, { recursive: true, force: true }); }
+});
+
+test('escaped descendant retaining pipes makes cancellation uncertain and blocks new work', async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'wrk-escape-'));
+  const dir = join(temp, 'wrk');
+  const pidPath = join(temp, 'escaped.pid');
+  const script = `const {spawn}=require("node:child_process");const c=spawn(process.execPath,["-e","setInterval(()=>{},1000)"],{detached:true,stdio:"inherit"});require("node:fs").writeFileSync(${JSON.stringify(pidPath)},String(c.pid));c.unref();setInterval(()=>{},1000)`;
+  const request = { runner: 'shell', prompt: '', options: { command: `${process.execPath} -e ${JSON.stringify(script)}` }, lifetime: 'independent', queue: null };
+  const job = admitJob(dir, { ownerId: 'owner', projectRoot: temp, cwd: temp, request });
+  const controller = new AbortController();
+  const work = runWorker({ storeDir: dir, pollMs: 5, signal: controller.signal, concurrency: 1 });
+  let escaped;
+  try {
+    await until(() => existsSync(pidPath));
+    escaped = Number(readFileSync(pidPath, 'utf8'));
+    requestCancel(dir, job.id);
+    await until(() => getJob(dir, job.id).status === 'uncertain', 2500);
+    assert.doesNotThrow(() => process.kill(escaped, 0));
+    const next = admitJob(dir, { ownerId: 'owner', projectRoot: temp, cwd: temp,
+      request: { ...request, options: { command: 'printf must-not-run' } } });
+    await new Promise(resolve => setTimeout(resolve, 30));
+    assert.equal(getJob(dir, next.id).status, 'queued');
+  } finally {
+    if (!escaped && existsSync(pidPath)) escaped = Number(readFileSync(pidPath, 'utf8'));
+    if (escaped) { try { process.kill(escaped, 'SIGKILL'); } catch (error) { if (error.code !== 'ESRCH') throw error; } }
+    controller.abort(); await work; rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('successful runner returning no summary succeeds in real YAML store', async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'wrk-empty-'));
+  const dir = join(temp, 'wrk');
+  const job = admitJob(dir, { ownerId: 'owner', projectRoot: temp, cwd: temp,
+    request: { runner: 'agent', prompt: 'read-only', options: {}, lifetime: 'independent', queue: null } });
+  const controller = new AbortController();
+  const work = runWorker({ storeDir: dir, pollMs: 5, signal: controller.signal, runners: { agent: async () => ({}) } });
+  try {
+    await until(() => ['succeeded', 'failed'].includes(getJob(dir, job.id).status));
+    assert.equal(getJob(dir, job.id).status, 'succeeded');
+  } finally { controller.abort(); await work; rmSync(temp, { recursive: true, force: true }); }
 });
 
 test('real store admits bounded child and releases parent slot', async () => {
@@ -173,6 +220,41 @@ test('real store admits bounded child and releases parent slot', async () => {
   try {
     await until(() => getJob(dir, parent.id).status === 'succeeded');
     assert.equal(getJob(dir, parent.id).summary, 'child finished');
+  } finally { controller.abort(); await running; rmSync(temp, { recursive: true, force: true }); }
+});
+
+test('swarm child jobs retain their own cwd, projectRoot and branch; arbitrary workspace rejected', async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'wrk-workspaces-'));
+  const git = (...args) => {
+    const result = spawnSync('git', ['-c', 'commit.gpgsign=false', ...args], { cwd: temp, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  git('init', '-q', '-b', 'main');
+  git('config', 'user.email', 'test@example.invalid'); git('config', 'user.name', 'Test');
+  writeFileSync(join(temp, '.gitignore'), '.agents/\n'); git('add', '.gitignore'); git('commit', '-qm', 'base');
+  const dir = join(temp, '.agents', 'wrk');
+  const parent = admitJob(dir, { ownerId: 'owner', projectRoot: temp, cwd: temp,
+    request: { runner: 'swarm', prompt: 'work', options: {}, lifetime: 'independent', queue: null } });
+  const controller = new AbortController();
+  const running = runWorker({ storeDir: dir, pollMs: 5, concurrency: 1, signal: controller.signal, runners: {
+    swarm: async (_, { createWorkspaces, submitChild, getChild }) => {
+      assert.throws(() => submitChild({ runner: 'agent', prompt: 'unsafe' }, { projectRoot: '/tmp', cwd: '/tmp' }), /unregistered/);
+      const spaces = createWorkspaces();
+      const children = spaces.children.map((workspace, n) => submitChild({ runner: 'agent', prompt: `part ${n}` }, workspace));
+      await Promise.all(children.map(child => getChild(child.id)));
+      return { summary: 'ready' };
+    },
+    agent: async job => {
+      assert.notEqual(job.projectRoot, temp);
+      assert.match(job.workspace.branch, /^wrk\/child-/);
+      assert.equal(job.cwd, job.projectRoot);
+      assert.equal(job.workspace.path, job.projectRoot);
+      return { summary: 'part complete' };
+    },
+  } });
+  try {
+    await until(() => ['succeeded', 'failed'].includes(getJob(dir, parent.id).status));
+    assert.equal(getJob(dir, parent.id).status, 'succeeded');
   } finally { controller.abort(); await running; rmSync(temp, { recursive: true, force: true }); }
 });
 
@@ -204,6 +286,41 @@ test('detached worker executes durable admission and reconnects without duplicat
         child.kill('SIGTERM');
         await closed;
       }
+    }
+    rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('notice failure cannot overwrite successful runner outcome', async () => {
+  const f = fixture([{ id: 'job' }]);
+  f.store.writeNotice = () => { throw new Error('notice unavailable'); };
+  const worker = await running(f, { agent: async () => ({ summary: 'completed' }) });
+  try {
+    await until(() => f.items.get('job').status === 'succeeded');
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.equal(f.items.get('job').summary, 'completed');
+  } finally { await worker.stop(); }
+});
+
+test('detached worker waits out a recent unverifiable lock and becomes ready', async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'wrk-restart-'));
+  const lock = join(temp, 'worker.lock');
+  writeFileSync(lock, 'pid: 999999\ntoken: old-unverified\nstartedAt: 1\n');
+  const old = new Date(Date.now() - 9600);
+  utimesSync(lock, old, old);
+  let child;
+  try {
+    await ensureWorker(temp, { timeoutMs: 4500, spawnWorker: (command, args, options) => {
+      child = spawn(command, args, options);
+      return child;
+    } });
+    assert.ok(child?.pid);
+  } finally {
+    if (child?.exitCode === null && child.signalCode === null) {
+      child.ref();
+      const closed = once(child, 'close');
+      child.kill('SIGTERM');
+      await closed;
     }
     rmSync(temp, { recursive: true, force: true });
   }

@@ -2,14 +2,16 @@ import { spawn, spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
+import { integrateSwarm } from './workspaces.mjs';
 
 const CAP = 1024 * 1024;
 const abortError = () => new Error('job cancelled');
 
-function processRun(command, args, { cwd, signal, emit = () => {} }) {
+function processRun(command, args, { cwd, signal, emit = () => {}, env }) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
+    const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
     let output = '';
     let aborting = false;
     let timer;
@@ -21,7 +23,14 @@ function processRun(command, args, { cwd, signal, emit = () => {} }) {
     const onAbort = () => {
       aborting = true;
       terminate();
-      timer = setTimeout(() => terminate(true), 1000);
+      timer = setTimeout(() => {
+        terminate(true);
+        // Escaped descendants can retain pipes. Do not wait forever or claim
+        // they stopped: the worker records an uncertain, blocking outcome.
+        child.stdout.destroy(); child.stderr.destroy();
+        signal?.removeEventListener('abort', onAbort);
+        reject(abortError());
+      }, 1000);
       timer.unref();
     };
     if (signal?.aborted) onAbort();
@@ -86,17 +95,21 @@ export function createRunners({ piCommand = 'pi', definitions, availableModels, 
     const model = options.model ?? selected?.model;
     if (model && !(availableModels ?? installedModels(piCommand)).includes(model)) throw new Error(`unknown model: ${model}`);
     const args = ['--mode', 'json', '--no-extensions', '--no-session', '--offline'];
+    const env = context.storeDir ? { ...process.env, PI_WRK_STORE: context.storeDir, PI_WRK_JOB_ID: job.id } : undefined;
+    if (env) args.push('--extension', fileURLToPath(new URL('../extensions/runner-messages.ts', import.meta.url)),
+      '--append-system-prompt', 'Use wrk_message for concise questions, blockers, guidance or results for the submitting session. A stored message does not imply a reply.');
     const tools = options.tools ?? selected?.tools;
     if (tools) args.push('--tools', Array.isArray(tools) ? tools.join(',') : tools);
     if (model) args.push('--model', model);
     if (selected?.prompt) args.push('--system-prompt', selected.prompt);
+    if (options.systemInstruction) args.push('--append-system-prompt', options.systemInstruction);
     args.push('--', job.request.prompt);
-    const result = await invoke(piCommand, args, { cwd: job.cwd, signal: context.signal, emit: context.emit });
+    const result = await invoke(piCommand, args, { cwd: job.cwd, signal: context.signal, emit: context.emit, env });
     const summary = completed(result);
     return { summary, output: summary };
   }
   async function ask(job, context, instruction) {
-    return (await agent({ ...job, request: { runner: 'agent', prompt: `${instruction}\n\nTask:\n${job.request.prompt}`, options: {} } }, context, { model: job.request.options?.model })).summary;
+    return (await agent({ ...job, request: { runner: 'agent', prompt: `${instruction}\n\nTask:\n${job.request.prompt}`, options: {} } }, context, { model: job.request.options?.model, tools: 'read,grep,find,ls' })).summary;
   }
   async function group(job, context, kind) {
     const council = kind === 'council';
@@ -106,10 +119,16 @@ export function createRunners({ piCommand = 'pi', definitions, availableModels, 
     let assignments;
     try { assignments = JSON.parse(proposal); } catch { throw new Error(`invalid ${kind} assignments`); }
     if (!Array.isArray(assignments) || assignments.length !== 2 || assignments.some(p => typeof p !== 'string' || !p.trim())) throw new Error(`invalid ${kind} assignments`);
-    const children = assignments.map(prompt => context.submitChild({ runner: 'agent', prompt: council ? `Read-only assessment (${prompt}): ${job.request.prompt}` : prompt, options: council ? { tools: 'read,grep,find,ls' } : {} }));
+    const spaces = council ? null : context.createWorkspaces();
+    const children = assignments.map((prompt, index) => context.submitChild({ runner: 'agent',
+      prompt: council ? `Read-only assessment (${prompt}): ${job.request.prompt}` : prompt,
+      options: council ? { tools: 'read,grep,find,ls' } : { systemInstruction: 'Work only in this isolated Git worktree. Commit only your own changes using git -c commit.gpgsign=false commit. Never change the main branch or other worktrees. Report if you made no commits.' },
+    }, spaces?.children[index]));
     const results = await Promise.all(children.map(child => context.getChild(child.id)));
-    if (results.some(result => result.status !== 'succeeded')) throw new Error(`${kind} child failed or cancelled`);
-    return { summary: await ask(job, context, `Synthesize these independent ${kind} results. Do not claim unfinished work succeeded.\n${results.map(r => r.summary).join('\n---\n')}`) };
+    if (results.some(result => result.status !== 'succeeded')) throw new Error(`${kind} child failed or cancelled${spaces ? `; retained integration ${spaces.integration.branch} at ${spaces.integration.projectRoot}; children ${spaces.children.map(c => `${c.branch} at ${c.projectRoot}`).join(', ')}` : ''}`);
+    const report = spaces ? integrateSwarm(spaces) : '';
+    const summary = await ask(job, context, `Synthesize these independent ${kind} results. Do not claim unfinished work succeeded.\n${results.map(r => r.summary).join('\n---\n')}\n${report}`);
+    return { summary: `${summary}${report ? `\n${report}` : ''}` };
   }
   return {
     agent,
