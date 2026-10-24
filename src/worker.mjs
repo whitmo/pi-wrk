@@ -30,7 +30,7 @@ function ping(storeDir, token, timeoutMs = 400) {
   });
 }
 
-export async function ensureWorker(storeDir, { workerCommand = process.execPath, timeoutMs = 5000 } = {}) {
+export async function ensureWorker(storeDir, { workerCommand = process.execPath, timeoutMs = 5000, spawnWorker = spawn } = {}) {
   storeDir = resolve(storeDir);
   mkdirSync(storeDir, { recursive: true, mode: 0o700 });
   const existing = identity(storeDir);
@@ -38,7 +38,7 @@ export async function ensureWorker(storeDir, { workerCommand = process.execPath,
   const log = openSync(join(storeDir, 'worker.log'), 'a', 0o600);
   let child;
   try {
-    child = spawn(workerCommand, [fileURLToPath(new URL('../bin/pi-wrk.mjs', import.meta.url)), 'worker', '--store', storeDir], {
+    child = spawnWorker(workerCommand, [fileURLToPath(new URL('../bin/pi-wrk.mjs', import.meta.url)), 'worker', '--store', storeDir], {
       detached: true, stdio: ['ignore', log, log], cwd: storeDir,
     });
     child.unref();

@@ -5,7 +5,8 @@ import { admitJob, getJob, readJobOutput, requestCancel, touchOwner } from '../s
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { once } from 'node:events';
 import { runWorker, ensureWorker } from '../src/worker.mjs';
 
 function fixture(jobs) {
@@ -173,6 +174,39 @@ test('real store admits bounded child and releases parent slot', async () => {
     await until(() => getJob(dir, parent.id).status === 'succeeded');
     assert.equal(getJob(dir, parent.id).summary, 'child finished');
   } finally { controller.abort(); await running; rmSync(temp, { recursive: true, force: true }); }
+});
+
+test('detached worker executes durable admission and reconnects without duplicate launch', async () => {
+  const temp = mkdtempSync(join(tmpdir(), 'wrk-detached-'));
+  const dir = join(temp, 'wrk');
+  const children = [];
+  const options = {
+    workerCommand: '/pi-wrk-test-captured-node',
+    spawnWorker: (_command, args, config) => {
+      const child = spawn(process.execPath, args, config);
+      children.push(child);
+      return child;
+    },
+  };
+  const job = admitJob(dir, { ownerId: 'test-owner', projectRoot: temp, cwd: temp,
+    request: { runner: 'shell', prompt: '', options: { command: 'printf detached-ok' }, lifetime: 'independent', queue: null } });
+  try {
+    await ensureWorker(dir, options);
+    await Promise.all([ensureWorker(dir, options), ensureWorker(dir, options)]);
+    assert.equal(children.length, 1);
+    await until(() => getJob(dir, job.id).status === 'succeeded');
+    assert.equal(readJobOutput(dir, job.id), 'detached-ok');
+  } finally {
+    for (const child of children) {
+      if (child.exitCode === null && child.signalCode === null) {
+        child.ref();
+        const closed = once(child, 'close');
+        child.kill('SIGTERM');
+        await closed;
+      }
+    }
+    rmSync(temp, { recursive: true, force: true });
+  }
 });
 
 test('ensureWorker reports a startup error rather than accepting dead worker', async () => {
