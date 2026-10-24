@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import YAML from 'yaml';
 import { integrateSwarm } from './workspaces.mjs';
+import { formatFocus, normalizeFocus } from './focus.mjs';
 
 const CAP = 1024 * 1024;
 const abortError = () => new Error('job cancelled');
@@ -95,7 +96,15 @@ export function createRunners({ piCommand = 'pi', definitions, availableModels, 
     const model = options.model ?? selected?.model;
     if (model && !(availableModels ?? installedModels(piCommand)).includes(model)) throw new Error(`unknown model: ${model}`);
     const args = ['--mode', 'json', '--no-extensions', '--no-session', '--offline'];
+    const focus = normalizeFocus(job.focus);
     const env = context.storeDir ? { ...process.env, PI_WRK_STORE: context.storeDir, PI_WRK_JOB_ID: job.id } : undefined;
+    if (focus?.mode === 'active') {
+      const { prepareFocusActivation } = await import('./focus-runtime.mjs');
+      await prepareFocusActivation(focus);
+      if (!env) throw new Error('pi-focus activation requires a persisted worker job');
+      args.push('--extension', fileURLToPath(new URL('../extensions/runner-focus.ts', import.meta.url)));
+    }
+    if (focus) args.push('--append-system-prompt', formatFocus(focus));
     if (env) args.push('--extension', fileURLToPath(new URL('../extensions/runner-messages.ts', import.meta.url)),
       '--append-system-prompt', 'Use wrk_message for concise questions, blockers, guidance or results for the submitting session. A stored message does not imply a reply.');
     const tools = options.tools ?? selected?.tools;
