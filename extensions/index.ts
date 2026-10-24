@@ -37,11 +37,12 @@ type Dependencies = {
   storePath(root: string): string;
   admitJob(dir: string, input: { request: Request; ownerId: string; projectRoot: string; cwd: string; handoff?: Job['handoff'] }): Job;
   listJobs(dir: string): Job[];
+  listQueues?(dir: string): Array<{ name: string }>;
   getJob(dir: string, id: string): Job;
   updateJob(dir: string, id: string, patch: Partial<Job>): Job;
   requestCancel(dir: string, id: string): void;
   readJobOutput(dir: string, id: string): string;
-  readNotices(dir: string, ownerId: string): Array<{ jobId: string; message: string }>;
+  readNotices(dir: string, ownerId: string): Array<{ id?: string; jobId: string; message: string; kind?: string; createdAt?: string }>;
   writeNotice?(dir: string, notice: { ownerId: string; jobId: string; message: string; kind: string }): void;
   touchOwner(dir: string, ownerId: string): void;
   closeOwner(dir: string, ownerId: string): void;
@@ -140,6 +141,13 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     const [verb, id, extra] = args.trim().split(/\s+/);
     const dir = session.dir;
     try {
+      if (verb === 'queues') {
+        if (id) throw new Error('Usage: /wrk queues');
+        const queues = deps.listQueues?.(dir);
+        if (!queues) throw new Error('Queue inspection unavailable');
+        notify(ctx, queues.length ? queues.map(queue => queue.name).join('\n') : 'No queues');
+        return;
+      }
       if (!args.trim() || verb === 'jobs') {
         if (id) throw new Error('Usage: /wrk jobs');
         const jobs = deps.listJobs(dir);
@@ -174,7 +182,19 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     const dir = deps.storePath(deps.projectRoot(ctx.cwd));
     const ownerId = deps.newOwnerId();
     deps.touchOwner(dir, ownerId);
-    const timer = deps.setInterval(() => { try { deps.touchOwner(dir, ownerId); } catch { /* command will report store errors */ } }, 5000);
+    const delivered = new Set<string>();
+    const timer = deps.setInterval(() => {
+      if (current(ctx)?.ownerId !== ownerId) return;
+      try {
+        deps.touchOwner(dir, ownerId);
+        for (const notice of deps.readNotices(dir, ownerId)) {
+          const key = notice.id ?? `${notice.jobId}:${notice.createdAt ?? ''}:${notice.kind ?? ''}:${notice.message}`;
+          if (delivered.has(key)) continue;
+          notify(ctx, `${notice.jobId}: ${notice.message}`, notice.kind === 'question' ? 'warning' : notice.kind === 'failed' || notice.kind === 'error' ? 'error' : 'info');
+          delivered.add(key);
+        }
+      } catch { /* durable notices remain available through /wrk status */ }
+    }, 5000);
     timer.unref?.();
     active = { sessionId: ctx.sessionManager.getSessionId(), ownerId, dir, timer };
     turn = undefined;
@@ -221,7 +241,7 @@ export default async function extension(pi: ExtensionAPI): Promise<void> {
   createExtension(pi, {
     parseRequest: (text, options) => request.parseRequest(text, options) as Request,
     storePath: store.storePath,
-    admitJob: store.admitJob, listJobs: store.listJobs, getJob: store.getJob,
+    admitJob: store.admitJob, listJobs: store.listJobs, listQueues: store.listQueues, getJob: store.getJob,
     updateJob: store.updateJob, requestCancel: store.requestCancel,
     readJobOutput: store.readJobOutput, readNotices: store.readNotices,
     writeNotice: store.writeNotice, touchOwner: store.touchOwner,
