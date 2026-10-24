@@ -69,14 +69,16 @@ export function parseRequest(text, { alias = '&' } = {}) {
     if (/^[A-Za-z][\w-]*:\{/.test(source) && !/^(?:a|sh):\{/.test(source))
       throw new Error('unknown selector');
   }
+  let explicitRunner = false;
   for (const type of ['a', 'sh']) {
     if (source.startsWith(`${type}:`)) {
       [options, source] = consumeMap(source, type);
       runner = SELECTORS[type][0];
+      explicitRunner = true;
       break;
     }
   }
-  if (runner === (alias === 'bg' ? 'agent' : 'router')) {
+  if (!explicitRunner) {
     for (const keyword of ['bg', 'swarm', 'council', 'todo']) {
       if (source === keyword || (source.startsWith(keyword) && /\s/.test(source[keyword.length] ?? ''))) {
         runner = keyword === 'bg' ? 'agent' : keyword;

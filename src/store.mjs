@@ -9,7 +9,7 @@ import { parseDocument, stringify } from 'yaml';
 
 const UUID = /^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i;
 const OWNER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const IMMUTABLE = new Set(['id', 'request', 'ownerId', 'projectRoot', 'cwd', 'createdAt', 'parentId', 'lifetime', 'queue', 'handoff']);
+const IMMUTABLE = new Set(['id', 'request', 'ownerId', 'projectRoot', 'cwd', 'createdAt', 'parentId', 'lifetime', 'queue']);
 const OUTPUT_LIMIT = 1_048_576;
 
 function jobId(id) {
@@ -124,8 +124,9 @@ export function storePath(projectRoot) {
   return join(resolve(projectRoot), '.agents', 'wrk');
 }
 
-export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, handoff } = {}) {
+export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, handoff, parentId } = {}) {
   ownerId(owner);
+  if (parentId !== undefined) existingJob(storeDir, jobId(parentId));
   if (!isAbsolute(projectRoot ?? '') || !isAbsolute(cwd ?? '')) throw new Error('project root and cwd must be absolute');
   safeData(request);
   if (!request || typeof request !== 'object' || Array.isArray(request) || typeof request.runner !== 'string' ||
@@ -140,6 +141,7 @@ export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, 
     const job = { id, request, ownerId: owner, projectRoot: resolve(projectRoot), cwd: resolve(cwd),
       status: 'queued', createdAt: now, updatedAt: now };
     if (handoff !== undefined) job.handoff = handoff;
+    if (parentId !== undefined) job.parentId = parentId;
     try { atomic(join(jobs, `${id}.yaml`), job, { exclusive: true }); return job; }
     catch (error) { if (error.code !== 'EEXIST') throw error; }
   }
