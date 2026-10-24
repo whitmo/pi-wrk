@@ -20,7 +20,7 @@ flow mappings; supported bare keywords swarm, council, todo, bg.
 Lifetime flag only at beginning `--lifetime session|independent`.
 Preserve prompt text after parsing control prefix; reject malformed maps,
 unknown keys, invalid lifetimes, empty explicit tasks, queue path escapes.
-`/wrk jobs|status|output|cancel` is command-layer syntax, not parseRequest.
+`/wrk jobs|queues|status|output|cancel` is command-layer syntax, not parseRequest.
 
 `src/store.mjs` exports:
 - `storePath(projectRoot)` -> absolute .agents/wrk path.
@@ -28,6 +28,8 @@ unknown keys, invalid lifetimes, empty explicit tasks, queue path escapes.
   -> persisted Job, with UUID `id`, request, ownerId, absolute projectRoot,
   cwd, status queued, createdAt, updatedAt; atomic YAML file in jobs/id.yaml.
 - `listJobs(storeDir)` -> Job[] newest first.
+- `listQueues(storeDir)` -> persisted queue definitions, sorted by name.
+  Named admission creates the definition without replacing existing data.
 - `getJob(storeDir, id)` -> Job (throws on missing/invalid id).
 - `updateJob(storeDir, id, patch)` -> Job; worker is sole status writer.
 - `requestCancel(storeDir, id)` -> void (separate atomic cancellation marker).
@@ -51,12 +53,20 @@ PID-only kill/check is forbidden. No arbitrary process adopted by old PID.
 `runWorker({storeDir, pollMs=100, leaseMs=15000, concurrency=3, runners?})`
 -> Promise<void>; CLI handles signals; injectable runners for tests.
 Runners are keyed by runner kind and signature async `(job, {signal, emit,
-submitChild, getChild}) -> { summary?, output? }`; spawn argument arrays.
+storeDir, submitChild, getChild, createWorkspaces?}) -> { summary?, output? }`;
+spawn argument arrays. Swarm child submission must use a workspace supplied
+by createWorkspaces; its project root/cwd are the isolated checkout.
 Handle router/council/swarm/todo explicitly, not fake aliases for one agent.
-Children preserve owner, lifetime, project root and cwd, plus parentId.
+Children preserve owner, lifetime and parentId. Council/router children
+preserve project root/cwd; swarm children record their own worktree paths
+and branches. Integration occurs only in a separate retained worktree.
 Never rerun interrupted jobs automatically. Scheduler obeys queue FIFO and
 concurrency, including cancellation and session lease expiry while queued.
 Shell runner cancellation must terminate and confirm descendants.
+**Unfinished:** process-group signalling does not satisfy that requirement.
+The prototype instead records real running cancellation and lost worker
+identity as uncertain, blocks all new launches, and requires operator
+resolution. Never describe that as confirmed termination or full recovery.
 
 `src/runners.mjs`: `createRunners({piCommand='pi', ...options}={})` -> runner map.
 Use actual installed CLI docs; no invented APIs. Child resources controlled,
@@ -74,6 +84,11 @@ may expose jobs/status/output/cancel using same store and validation.
 subcommands synchronously, calls ensureWorker in detached promise with catch
 notices. UI updates, never send raw work as main prompt, never waitForIdle.
 Session owner generated UUID; 5s lease heartbeat; shutdown closes owner.
+Heartbeat also delivers owner-scoped notices once per active session by
+stable notice ID. It must check session identity before UI delivery.
+`extensions/runner-messages.ts` is an explicitly loaded internal extension
+only in worker-owned agents. Its real wrk_message tool writes owner-scoped
+durable notices using PI_WRK_STORE/PI_WRK_JOB_ID; it cannot imply a reply.
 New session IDs get different owners; stale contexts never used for UI.
 Handoff admission requires a continuation snapshot of unfinished request,
 then abort foreground and WAIT asynchronously for genuine settle event

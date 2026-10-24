@@ -4,7 +4,7 @@ Immediate background jobs for Pi. A slash command durably admits a job in
 `<project>/.agents/wrk/` and returns without waiting for a model or worker.
 A detached local worker owns execution; status, notices and bounded output
 remain inspectable after a foreground turn ends. Runtime data is private and
-Git-ignored. Node >=22 is required.
+Git-ignored. Node >=22 on macOS or Linux is required.
 
 ## Setup
 
@@ -25,12 +25,21 @@ settings or reload a running session.
 - `/& q:{name: review} <prompt>`: enqueue on a FIFO, one-at-a-time queue.
   An agent or shell selector can follow the queue selector.
 - `/& council <prompt>` and `/& swarm <prompt>`: bounded two-child work,
-  followed by synthesis. Council children use read-only tools.
+  followed by synthesis. Council children use read-only tools. Swarm requires
+  a clean Git checkout; children commit on separate worktree branches and
+  one integration worktree combines their commits. The submitting checkout
+  stays unchanged. Conflicts and all worktrees are retained for inspection.
 - `/& todo`: blocked until a real shared todo-provider adapter is wired.
   No task-provider bridge has been confirmed.
-- `/wrk` or `/wrk jobs`: list jobs. `/wrk status <id>` includes durable
-  notices and startup failures; `/wrk output <id>` reads bounded output;
-  `/wrk cancel <id>` requests cancellation, then status confirms outcome.
+- `/wrk` or `/wrk jobs`: list jobs. `/wrk queues` lists persistent queue
+  definitions. `/wrk status <id>` includes durable notices and startup
+  failures; `/wrk output <id>` reads bounded output; `/wrk cancel <id>`
+  requests cancellation. Cancellation is not proof of termination.
+
+Worker-owned agents have a `wrk_message` tool for questions, blockers and
+results. The submitting session displays durable notices on its heartbeat,
+without injecting a foreground prompt or model turn. Notices remain on disk
+if the owner is absent. This is one-way delivery, not a reply channel.
 
 The default `session` lifetime ends with the submitting session's lease,
 including queued work. Prefix a request with `--lifetime independent` to
@@ -50,6 +59,16 @@ A model invocation cannot be transplanted. Submit a new explicit prompt
 if the conservative handoff guard refuses the request.
 
 ## Verification and limits
+
+This is an incomplete prototype, not a fully confirmed cancellation or
+recovery service. Cancellation signals the original process group but
+cannot prove that escaped descendants stopped. Real running cancellations
+and jobs whose worker identity was lost become **uncertain**. That blocks
+all new execution in the store, even unrelated jobs. Do not clear this state
+until an operator has checked and stopped survivors. Queued cancellation
+can be confirmed because no command started. Restart never reruns unknown
+work or signals an old PID. See [operator notes](docs/devops/prototype.md).
+
 
 The node:test suite covers parsing, durable store, worker/runners, command
 routing, busy-foreground isolation, startup failures and handoff against
