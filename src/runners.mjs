@@ -1,0 +1,140 @@
+import { spawn, spawnSync } from 'node:child_process';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
+import YAML from 'yaml';
+
+const CAP = 1024 * 1024;
+const abortError = () => new Error('job cancelled');
+
+function processRun(command, args, { cwd, signal, emit = () => {} }) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { cwd, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
+    let output = '';
+    let aborting = false;
+    let timer;
+    const terminate = (force = false) => {
+      if (!child.pid) return;
+      try { process.kill(process.platform === 'win32' ? child.pid : -child.pid, force ? 'SIGKILL' : 'SIGTERM'); }
+      catch (error) { if (error.code !== 'ESRCH') reject(error); }
+    };
+    const onAbort = () => {
+      aborting = true;
+      terminate();
+      timer = setTimeout(() => terminate(true), 1000);
+      timer.unref();
+    };
+    if (signal?.aborted) onAbort();
+    else signal?.addEventListener('abort', onAbort, { once: true });
+    for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => {
+      const text = chunk.toString();
+      output = (output + text).slice(-CAP);
+      emit(text);
+    });
+    child.once('error', error => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); reject(error); });
+    child.once('close', (code, sig) => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+      if (aborting || signal?.aborted) { terminate(true); reject(abortError()); }
+      else resolve({ code, signal: sig, output });
+    });
+  });
+}
+
+function completed(result) {
+  if (result.code !== 0) throw new Error(`process exited ${result.code ?? result.signal}: ${result.output.slice(-2000)}`);
+  let settled = false;
+  let assistant;
+  for (const line of result.output.split('\n')) {
+    if (!line.trim()) continue;
+    let event;
+    try { event = JSON.parse(line); } catch { continue; }
+    if (event.type === 'message_end' && event.message?.role === 'assistant') assistant = event.message;
+    if (event.type === 'agent_settled') settled = true;
+  }
+  if (!settled || !assistant) throw new Error('Pi did not report an agent_settled assistant result');
+  if (assistant.stopReason !== 'stop') throw new Error(assistant.errorMessage || `Pi stopped: ${assistant.stopReason}`);
+  return assistant.content?.filter(block => block.type === 'text').map(block => block.text).join('\n') || '';
+}
+
+function installedDefinitions(cwd) {
+  const definitions = {};
+  for (const dir of [join(homedir(), '.pi/agent/agents'), join(cwd, '.pi/agents')]) {
+    if (!existsSync(dir)) continue;
+    for (const name of readdirSync(dir).filter(n => n.endsWith('.md'))) {
+      const source = readFileSync(join(dir, name), 'utf8');
+      const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/.exec(source);
+      if (!match) continue;
+      const data = YAML.parse(match[1]);
+      if (typeof data?.name === 'string') definitions[data.name] = { ...data, prompt: match[2] };
+    }
+  }
+  return definitions;
+}
+
+function installedModels(piCommand) {
+  const result = spawnSync(piCommand, ['--offline', '--list-models'], { encoding: 'utf8', timeout: 10000 });
+  if (result.error || result.status !== 0) throw new Error(`cannot list Pi models: ${result.error?.message || result.stderr}`);
+  return result.stdout.split('\n').slice(1).map(line => line.trim().split(/\s+/).slice(0, 2).join('/'));
+}
+
+export function createRunners({ piCommand = 'pi', definitions, availableModels, invoke = processRun, todoAdapter } = {}) {
+  async function agent(job, context, extra = {}) {
+    const options = { ...job.request.options, ...extra };
+    const selected = options.name ? (definitions ?? installedDefinitions(job.cwd))[options.name] : null;
+    if (options.name && !selected) throw new Error(`unknown agent: ${options.name}`);
+    const model = options.model ?? selected?.model;
+    if (model && !(availableModels ?? installedModels(piCommand)).includes(model)) throw new Error(`unknown model: ${model}`);
+    const args = ['--mode', 'json', '--no-extensions', '--no-session', '--offline'];
+    const tools = options.tools ?? selected?.tools;
+    if (tools) args.push('--tools', Array.isArray(tools) ? tools.join(',') : tools);
+    if (model) args.push('--model', model);
+    if (selected?.prompt) args.push('--system-prompt', selected.prompt);
+    args.push('--', job.request.prompt);
+    const result = await invoke(piCommand, args, { cwd: job.cwd, signal: context.signal, emit: context.emit });
+    const summary = completed(result);
+    return { summary, output: summary };
+  }
+  async function ask(job, context, instruction) {
+    return (await agent({ ...job, request: { runner: 'agent', prompt: `${instruction}\n\nTask:\n${job.request.prompt}`, options: {} } }, context, { model: job.request.options?.model })).summary;
+  }
+  async function group(job, context, kind) {
+    const council = kind === 'council';
+    const proposal = await ask(job, context, council
+      ? 'Return ONLY a JSON array of two different assessment perspectives. No markdown.'
+      : 'Return ONLY a JSON array of two independent, bounded assignments. No markdown.');
+    let assignments;
+    try { assignments = JSON.parse(proposal); } catch { throw new Error(`invalid ${kind} assignments`); }
+    if (!Array.isArray(assignments) || assignments.length !== 2 || assignments.some(p => typeof p !== 'string' || !p.trim())) throw new Error(`invalid ${kind} assignments`);
+    const children = assignments.map(prompt => context.submitChild({ runner: 'agent', prompt: council ? `Read-only assessment (${prompt}): ${job.request.prompt}` : prompt, options: council ? { tools: 'read,grep,find,ls' } : {} }));
+    const results = await Promise.all(children.map(child => context.getChild(child.id)));
+    if (results.some(result => result.status !== 'succeeded')) throw new Error(`${kind} child failed or cancelled`);
+    return { summary: await ask(job, context, `Synthesize these independent ${kind} results. Do not claim unfinished work succeeded.\n${results.map(r => r.summary).join('\n---\n')}`) };
+  }
+  return {
+    agent,
+    shell: async (job, context) => {
+      const command = job.request.options?.command;
+      if (typeof command !== 'string' || !command.trim()) throw new Error('shell requires explicit sh:{command: ...}');
+      const result = await invoke('/bin/sh', ['-c', command], { cwd: job.cwd, signal: context.signal, emit: context.emit });
+      if (result.code !== 0) throw new Error(`shell exited ${result.code ?? result.signal}: ${result.output.slice(-2000)}`);
+      return { summary: `shell exited 0`, output: result.output };
+    },
+    router: async (job, context) => {
+      const selected = (await ask(job, context, 'Select exactly one route from agent, council, swarm. Output ONLY a JSON string such as "agent". Never select shell or todo.')).trim();
+      let route;
+      try { route = JSON.parse(selected); } catch { throw new Error('invalid route'); }
+      if (!['agent', 'council', 'swarm'].includes(route)) throw new Error('invalid route');
+      const child = context.submitChild({ runner: route, prompt: job.request.prompt, options: job.request.options });
+      const result = await context.getChild(child.id);
+      if (result.status !== 'succeeded') throw new Error(`routed child ${result.status}`);
+      return { summary: result.summary };
+    },
+    council: (job, context) => group(job, context, 'council'),
+    swarm: (job, context) => group(job, context, 'swarm'),
+    todo: async (job, context) => {
+      if (!todoAdapter) throw new Error('todo provider unavailable: shared task adapter not configured');
+      return todoAdapter(job, context);
+    },
+  };
+}
