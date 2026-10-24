@@ -7,7 +7,7 @@ import { parse } from 'yaml';
 import {
   storePath, admitJob, listJobs, getJob, updateJob, requestCancel,
   isCancelRequested, touchOwner, closeOwner, ownerAlive, readJobOutput,
-  appendJobOutput, writeNotice, readNotices,
+  appendJobOutput, writeNotice, readNotices, listQueues,
 } from '../src/store.mjs';
 
 function fixture(t) {
@@ -34,6 +34,16 @@ test('admission persists YAML with private permissions and exclusive UUID identi
   assert.equal(statSync(join(dir, 'jobs', `${a.id}.yaml`)).mode & 0o777, 0o600);
   assert.equal(parse(readFileSync(join(dir, 'jobs', `${a.id}.yaml`), 'utf8')).id, a.id);
   assert.equal(readdirSync(join(dir, 'jobs')).length, 2);
+});
+
+test('queue definitions survive jobs and reject path-like queue names', t => {
+  const { dir, input } = fixture(t);
+  const job = admitJob(dir, { ...input, request: { ...input.request, queue: 'review' } });
+  rmSync(join(dir, 'jobs', `${job.id}.yaml`));
+  assert.deepEqual(listQueues(dir).map(queue => queue.name), ['review']);
+  admitJob(dir, { ...input, request: { ...input.request, queue: 'review' } });
+  assert.equal(listQueues(dir).length, 1);
+  assert.throws(() => admitJob(dir, { ...input, request: { ...input.request, queue: '../escape' } }), /queue/i);
 });
 
 test('updates are atomic replacements and may not alter immutable identity fields', t => {

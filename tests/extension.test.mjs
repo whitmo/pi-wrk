@@ -19,6 +19,7 @@ function harness({ startup = () => Promise.resolve(), parser, realStore } = {}) 
   let busy = false;
   let aborted = 0;
   let starts = 0;
+  let heartbeat;
   const branch = [{ id: 'prompt-1', type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'Unfinished request' }] } }];
   const ctx = {
     cwd: '/project', mode: 'tui', hasUI: true,
@@ -47,7 +48,7 @@ function harness({ startup = () => Promise.resolve(), parser, realStore } = {}) 
     closeOwner: (_, id) => ui.push({ closed: id }),
     ensureWorker: () => { starts++; return startup(); },
     projectRoot: () => '/project',
-    setInterval: () => ({ unref() {} }),
+    setInterval: (callback) => { heartbeat = callback; return { unref() {} }; },
     clearInterval: () => {},
     newOwnerId: () => `owner-${owner}`,
   };
@@ -56,7 +57,7 @@ function harness({ startup = () => Promise.resolve(), parser, realStore } = {}) 
   createExtension(pi, deps);
   const command = (name, input = '') => commands.get(name)(input, ctx);
   const event = (name, payload = {}, context = ctx) => events.get(name)?.(payload, context);
-  return { command, event, ctx, jobs, ui, branch, notices, get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
+  return { command, event, ctx, jobs, ui, branch, notices, tick: () => heartbeat?.(), get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
 }
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
@@ -74,6 +75,34 @@ test('busy primary admits /bg durably without waiting, aborting, or sending fore
   assert.equal(h.starts, 1);
   assert.equal(h.aborted, 0);
   assert.match(h.ui.at(-1).message, /queued.*session/i);
+});
+
+test('/wrk queues inspects persistent queue definitions without submitting work', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-queue-ui-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = store.storePath(root);
+  store.admitJob(dir, { ownerId: 'other-owner', projectRoot: root, cwd: root,
+    request: { runner: 'agent', prompt: 'inspect', options: {}, queue: 'review', lifetime: 'independent' } });
+  const h = harness({ realStore: dir });
+  await h.event('session_start');
+  await h.command('wrk', 'queues');
+  assert.equal(h.ui.at(-1).message, 'review');
+  assert.equal(h.starts, 0);
+  assert.equal(store.listJobs(dir).length, 1);
+});
+
+test('heartbeat delivers durable questions once without foreground work or stale-session UI', async () => {
+  const h = harness();
+  await h.event('session_start');
+  h.notices.push({ id: 'notice-1', jobId: 'job-1', message: 'Which config should I use?', kind: 'question' });
+  h.tick(); h.tick();
+  assert.equal(h.ui.filter(item => item.message?.includes('Which config')).length, 1);
+  assert.equal(h.starts, 0);
+  h.session('new-session');
+  h.notices.push({ id: 'notice-2', jobId: 'job-1', message: 'stale-session-question', kind: 'question' });
+  h.tick();
+  assert.equal(h.ui.some(item => item.message?.includes('stale-session-question')), false);
+  assert.equal(h.notices.length, 2);
 });
 
 test('startup failure is visible on status and a durable notice, not reported as running', async () => {

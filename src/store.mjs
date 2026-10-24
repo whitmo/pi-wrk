@@ -11,6 +11,22 @@ const UUID = /^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12
 const OWNER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 const IMMUTABLE = new Set(['id', 'request', 'ownerId', 'projectRoot', 'cwd', 'createdAt', 'parentId', 'lifetime', 'queue']);
 const OUTPUT_LIMIT = 1_048_576;
+const QUEUE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+
+function queueName(name) {
+  if (typeof name !== 'string' || !QUEUE.test(name) || name.includes('..')) throw new Error('invalid queue name');
+  return name;
+}
+
+export function listQueues(storeDir) {
+  const dir = folder(storeDir, 'queues');
+  return readdirSync(dir).filter(name => name.endsWith('.yaml')).flatMap(name => {
+    try {
+      const queue = yamlRead(join(dir, `${queueName(name.slice(0, -5))}.yaml`));
+      return queue?.name === name.slice(0, -5) ? [queue] : [];
+    } catch { return []; }
+  }).sort((a, b) => a.name.localeCompare(b.name));
+}
 
 function jobId(id) {
   if (typeof id !== 'string' || !UUID.test(id)) throw new Error('invalid job id (UUID required)');
@@ -133,6 +149,15 @@ export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, 
       typeof request.prompt !== 'string' || !['session', 'independent'].includes(request.lifetime))
     throw new Error('invalid request');
   if (handoff !== undefined) safeData(handoff);
+  if (request.queue != null) {
+    const name = queueName(request.queue);
+    const path = location(storeDir, 'queues', `${name}.yaml`);
+    try { atomic(path, { name, createdAt: new Date().toISOString() }, { exclusive: true }); }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      if (yamlRead(path)?.name !== name) throw new Error('corrupt queue definition');
+    }
+  }
   const jobs = folder(storeDir, 'jobs');
   for (const name of ['cancels', 'owners', 'output', 'notices']) folder(storeDir, name);
   const now = new Date().toISOString();
@@ -235,7 +260,7 @@ export function readNotices(storeDir, owner) {
       try {
         const notice = yamlRead(join(dir, name));
         return notice?.ownerId === owner && UUID.test(notice.jobId ?? '') &&
-          typeof notice.message === 'string' && typeof notice.kind === 'string' ? [notice] : [];
+          typeof notice.message === 'string' && typeof notice.kind === 'string' ? [{ ...notice, id: name.slice(0, -5) }] : [];
       } catch { return []; }
     }).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
