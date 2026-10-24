@@ -138,7 +138,7 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
         if (!['agent', 'council', 'swarm'].includes(request.runner) || job.parentId && request.runner !== 'agent') throw new Error('invalid child runner or depth');
         if (workspace && !allowedWorkspaces.has(workspace) || job.request.runner === 'swarm' && !workspace) throw new Error('unregistered child workspace');
         if (workspace) allowedWorkspaces.delete(workspace);
-        const child = store.admitJob(storeDir, { request: { ...request, queue: null, lifetime: job.request.lifetime }, ownerId: job.ownerId, projectRoot: workspace?.projectRoot ?? job.projectRoot, cwd: workspace?.cwd ?? job.cwd, parentId: job.id });
+        const child = store.admitJob(storeDir, { request: { ...request, queue: null, lifetime: job.request.lifetime }, ownerId: job.ownerId, projectRoot: workspace?.projectRoot ?? job.projectRoot, cwd: workspace?.cwd ?? job.cwd, parentId: job.id, ...(job.focus ? { focus: job.focus } : {}) });
         return workspace ? update(child.id, { workspace: { branch: workspace.branch, path: workspace.projectRoot } }) : child;
       },
       getChild: async id => {

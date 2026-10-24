@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import { captureFocus } from '../src/focus.mjs';
 
 type Request = {
   runner: string;
@@ -10,6 +11,7 @@ type Request = {
   queue: string | null;
   lifetime: 'session' | 'independent';
   handoff: boolean;
+  focusMode?: 'context' | 'active' | 'none';
 };
 type Snapshot = { entryId: string; prompt: string; sessionId: string };
 type Job = {
@@ -22,7 +24,7 @@ type Job = {
 };
 type Session = {
   getSessionId(): string;
-  getBranch(): Array<{ id: string; type: string; message?: { role?: string; content?: unknown } }>;
+  getBranch(): Array<{ id: string; type: string; customType?: string; data?: unknown; message?: { role?: string; content?: unknown } }>;
 };
 type Context = {
   cwd: string;
@@ -35,7 +37,7 @@ type Pi = Pick<ExtensionAPI, 'registerCommand' | 'on'>;
 type Dependencies = {
   parseRequest(text: string, options: { alias: string }): Request;
   storePath(root: string): string;
-  admitJob(dir: string, input: { request: Request; ownerId: string; projectRoot: string; cwd: string; handoff?: Job['handoff'] }): Job;
+  admitJob(dir: string, input: { request: Request; ownerId: string; projectRoot: string; cwd: string; handoff?: Job['handoff']; focus?: unknown }): Job;
   listJobs(dir: string): Job[];
   listQueues?(dir: string): Array<{ name: string }>;
   getJob(dir: string, id: string): Job;
@@ -121,9 +123,14 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
         handoff = { ready: false, snapshot: { entryId: entry.id, prompt: turn.prompt, sessionId: session.sessionId }, reason: 'Awaiting foreground settlement' };
       }
       const dir = session.dir;
+      const root = deps.projectRoot(ctx.cwd);
+      const focus = request.runner === 'shell' ? undefined : captureFocus(
+        ctx.sessionManager.getBranch(), root, ctx.cwd, request.focusMode, process.env.PI_WRK_FOCUS_EXTENSION,
+      );
       const job = deps.admitJob(dir, {
         request, ownerId: session.ownerId,
-        projectRoot: deps.projectRoot(ctx.cwd), cwd: resolve(ctx.cwd), ...(handoff ? { handoff } : {}),
+        projectRoot: root, cwd: resolve(ctx.cwd), ...(handoff ? { handoff } : {}),
+        ...(focus ? { focus } : {}),
       });
       if (handoff) {
         pending = { jobId: job.id, dir, ownerId: session.ownerId, ctx, snapshot: handoff.snapshot, toolSeen: false };

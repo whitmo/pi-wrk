@@ -58,6 +58,33 @@ leaves a visible blocked job rather than replaying possible mutations.
 A model invocation cannot be transplanted. Submit a new explicit prompt
 if the conservative handoff guard refuses the request.
 
+## Focus inheritance
+
+Agents inherit the submitting session's active pi-focus v1 binding as a
+context snapshot: goals, scope, constraints, notes, references and knowledge
+paths. The snapshot is captured when queued and stays the same through
+routing, council/swarm children and synthesis. Focus paths point back to
+the source project, including when a child runs in another worktree. The
+parent conversation and knowledge-base contents are not copied.
+
+No active focus means no inherited context. `/bg --focus none <prompt>`
+opts out. Context-only inheritance does not load pi-focus or enable any
+focus-declared tools, presets or runbooks.
+
+For an actual child binding and pi-focus functionality, explicitly use
+`/bg --focus active <prompt>` (also supported by `/&` and `/wrk`). Before
+starting the submitting Pi process, set `PI_WRK_FOCUS_EXTENSION` to the
+absolute path of your trusted pi-focus `extensions/index.ts`. That entry
+must have the compatible v1 `focus-session.mjs` beside it. Only this chosen
+extension is loaded; unrelated extensions remain disabled. Missing focus,
+missing files or incompatible binding APIs fail rather than silently
+falling back. The path is captured per job, not taken from a stale worker's
+environment. Focus declarations still do not invoke presets or runbooks.
+
+`--focus context` explicitly selects the default. Focus and lifetime flags
+may appear in either order before the selector/task. Shell jobs do not
+inherit focus or support activation. Bare handoff also captures focus.
+
 ## Verification and limits
 
 This is an incomplete prototype, not a fully confirmed cancellation or

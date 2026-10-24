@@ -49,15 +49,21 @@ export function parseRequest(text, { alias = '&' } = {}) {
   if (!['&', 'bg', 'wrk'].includes(alias)) throw new Error('invalid command alias');
   let lifetime = 'session', runner = alias === 'bg' ? 'agent' : 'router';
   let options = {}, queue = null, source = text;
-  if (source.startsWith('--lifetime') && (source.length === 10 || /\s/.test(source[10]))) {
-    const match = /^--lifetime\s+(session|independent)(?=\s|$)/.exec(source);
-    if (!match) throw new Error('invalid lifetime');
-    lifetime = match[1];
+  const flags = {};
+  while (/^--(?:lifetime|focus)(?=\s|$)/.test(source)) {
+    const match = /^--(lifetime|focus)\s+(\S+)(?=\s|$)/.exec(source);
+    if (!match) throw new Error('invalid lifetime or focus');
+    const [, flag, value] = match;
+    if (flags[flag] || !(flag === 'focus' ? ['context', 'active', 'none'] : ['session', 'independent']).includes(value))
+      throw new Error(`invalid or duplicate ${flag}`);
+    flags[flag] = value;
     source = removeSeparator(source.slice(match[0].length));
   }
+  lifetime = flags.lifetime ?? lifetime;
+  const focus = flags.focus ? { focusMode: flags.focus } : {};
   if (!source.trim()) {
     if (alias === 'wrk') throw new Error('empty task');
-    return { runner: 'agent', prompt: '', options, queue, lifetime, handoff: true };
+    return { runner: 'agent', prompt: '', options, queue, lifetime, handoff: true, ...focus };
   }
   // The prefix is the only control surface. The remainder is opaque user text.
   if (/^[A-Za-z][\w-]*:\{/.test(source) && !/^(?:a|q|sh):\{/.test(source))
@@ -89,5 +95,6 @@ export function parseRequest(text, { alias = '&' } = {}) {
   }
   if (!source.trim() && runner !== 'todo' && !(runner === 'shell' && options.command))
     throw new Error('empty explicit task');
-  return { runner, prompt: source, options, queue, lifetime, handoff: false };
+  if (runner === 'shell' && flags.focus && flags.focus !== 'none') throw new Error('focus is not supported for shell jobs');
+  return { runner, prompt: source, options, queue, lifetime, handoff: false, ...focus };
 }

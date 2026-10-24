@@ -62,6 +62,30 @@ function harness({ startup = () => Promise.resolve(), parser, realStore } = {}) 
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
 
+test('submission persists current focus before queueing and respects later clear and opt-out', async t => {
+  const { entry } = await import('./fixtures/focus.mjs');
+  const { parseRequest } = await import('../src/request.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'wrk-focus-ui-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = store.storePath(root);
+  const h = harness({ realStore: dir, parser: parseRequest });
+  await h.event('session_start');
+  const binding = entry();
+  h.branch.push(binding);
+  await h.command('bg', 'first');
+  binding.data.active.focus.goals = 'Later goals';
+  await h.command('bg', '--focus none second');
+  h.branch.push(entry(null));
+  await h.command('bg', 'third');
+  const jobs = store.listJobs(dir);
+  assert.equal(jobs.find(j => j.request.prompt === 'first').focus.active.focus.goals, 'Ship small changes');
+  assert.equal(jobs.find(j => j.request.prompt === 'second').focus, undefined);
+  assert.equal(jobs.find(j => j.request.prompt === 'third').focus, undefined);
+  await h.command('bg', '--focus active fourth');
+  assert.equal(store.listJobs(dir).length, 3);
+  assert.match(h.ui.at(-1).message, /active focus/i);
+});
+
 test('busy primary admits /bg durably without waiting, aborting, or sending foreground input', async () => {
   const h = harness({ startup: () => new Promise(() => {}) });
   h.busy(true);
