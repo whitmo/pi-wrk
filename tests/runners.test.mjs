@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRunners } from '../src/runners.mjs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { createSwarmWorkspaces } from '../src/workspaces.mjs';
 
 const job = (runner, prompt = 'work', options = {}) => ({ id: 'job', cwd: process.cwd(), projectRoot: process.cwd(), request: { runner, prompt, options } });
 const ctx = (signal = new AbortController().signal) => ({ signal, emit: () => {} });
@@ -37,12 +42,30 @@ test('agent parses JSON completion and rejects failed assistant despite exit zer
   await assert.rejects(createRunners({ invoke }).agent(job('agent'), ctx()), /denied/);
 });
 
+test('agent explicitly loads only trusted message tool and passes scoped execution environment', async () => {
+  let call;
+  const invoke = async (command, args, config) => {
+    call = { command, args, config };
+    return { code: 0, output: [
+      JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'finished' }] } }),
+      JSON.stringify({ type: 'agent_settled' }),
+    ].join('\n') };
+  };
+  const context = { ...ctx(), storeDir: '/tmp/wrk-private' };
+  await createRunners({ invoke }).agent(job('agent', 'exact task'), context);
+  assert.ok(call.args.includes('--no-extensions'));
+  assert.match(call.args[call.args.indexOf('--extension') + 1], /extensions\/runner-messages\.ts$/);
+  assert.equal(call.config.env.PI_WRK_STORE, context.storeDir);
+  assert.equal(call.config.env.PI_WRK_JOB_ID, 'job');
+  assert.equal(call.args.at(-1), 'exact task');
+});
+
 test('router selects only a valid pattern, not unvalidated prose', async () => {
   const runners = createRunners({ invoke: async () => ({ code: 0, output: JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'shell' }] } }) + '\n' + JSON.stringify({ type: 'agent_settled' }) + '\n' }) });
   await assert.rejects(runners.router(job('router'), ctx()), /invalid route/i);
 });
 
-test('council and swarm use separate child assignments and synthesis', async () => {
+test('council uses separate read-only child assessments and synthesis', async () => {
   const prompts = [];
   const children = [];
   const context = { ...ctx(), submitChild: request => { prompts.push(request.prompt); const child = { id: `child-${prompts.length}` }; children.push(child); return child; }, getChild: async id => ({ status: 'succeeded', summary: `result from ${id}` }) };
@@ -50,9 +73,36 @@ test('council and swarm use separate child assignments and synthesis', async () 
   const runners = createRunners({ invoke });
   assert.equal((await runners.council(job('council'), context)).summary, 'combined');
   assert.equal(prompts.length, 2);
-  prompts.length = 0;
-  assert.equal((await runners.swarm(job('swarm'), context)).summary, 'combined');
+});
+
+test('swarm preserves exact assignments in isolated Git worktrees and integrates own commits', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-swarm-runner-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const git = (cwd, ...args) => {
+    const result = spawnSync('git', ['-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr);
+  };
+  git(root, 'init', '-q', '-b', 'main');
+  git(root, 'config', 'user.email', 'test@example.invalid'); git(root, 'config', 'user.name', 'Test');
+  writeFileSync(join(root, '.gitignore'), '.agents/\n'); git(root, 'add', '.gitignore'); git(root, 'commit', '-qm', 'base');
+  const prompts = [];
+  const context = { ...ctx(), createWorkspaces: () => createSwarmWorkspaces({ projectRoot: root, cwd: root }),
+    submitChild(request, workspace) {
+      prompts.push(request.prompt);
+      assert.ok(workspace.projectRoot.startsWith(join(root, '.agents', 'worktrees')) || workspace.projectRoot.includes('/.agents/worktrees/'));
+      writeFileSync(join(workspace.projectRoot, `part${prompts.length}.txt`), request.prompt);
+      git(workspace.projectRoot, 'add', '.'); git(workspace.projectRoot, 'commit', '-qm', 'child');
+      return { id: `child-${prompts.length}` };
+    }, getChild: async id => ({ status: 'succeeded', summary: `finished ${id}` }) };
+  const invoke = async (_command, args) => ({ code: 0, output: [
+    JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: args.at(-1).includes('Synthesize') ? 'reviewed' : '["part one", "part two"]' }] } }),
+    JSON.stringify({ type: 'agent_settled' }),
+  ].join('\n') });
+  const result = await createRunners({ invoke }).swarm({ ...job('swarm', 'build these'), projectRoot: root, cwd: root }, context);
   assert.deepEqual(prompts, ['part one', 'part two']);
+  assert.match(result.summary, /integration branch/);
+  assert.match(result.summary, /commits: 2/);
+  assert.equal(readFileSync(join(root, '.gitignore'), 'utf8'), '.agents/\n');
 });
 
 test('todo fails explicitly without shared task adapter', async () => {
