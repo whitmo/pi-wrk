@@ -108,6 +108,28 @@ test('parent may wait on child without occupying the last scheduler slot', async
   } finally { await worker.stop(); }
 });
 
+test('waiting parents release a slot without letting children exceed concurrency', async () => {
+  const f = fixture([{ id: 'parent', request: { runner: 'council', prompt: 'assess' } }]);
+  let live = 0, peak = 0;
+  const worker = await running(f, {
+    council: async (_, { submitChild, getChild }) => {
+      const children = ['first', 'second'].map(prompt => submitChild({ runner: 'agent', prompt }));
+      const results = await Promise.all(children.map(child => getChild(child.id)));
+      return { summary: results.map(result => result.summary).join(',') };
+    },
+    agent: async () => {
+      peak = Math.max(peak, ++live);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      live--;
+      return { summary: 'reviewed' };
+    },
+  }, { concurrency: 1 });
+  try {
+    await until(() => f.items.get('parent').status === 'succeeded');
+    assert.equal(peak, 1);
+  } finally { await worker.stop(); }
+});
+
 test('CLI rejects relative worker store and invalid job ids', () => {
   const bin = new URL('../bin/pi-wrk.mjs', import.meta.url).pathname;
   const relative = spawnSync(process.execPath, [bin, 'worker', '--store', 'relative'], { encoding: 'utf8' });

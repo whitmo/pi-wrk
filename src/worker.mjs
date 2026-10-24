@@ -96,6 +96,8 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
   runners ??= createRunners();
   const release = injectedStore ? null : await ownWorker(storeDir);
   const active = new Map();
+  const waiting = new Map();
+  const occupiedSlots = () => active.size - waiting.size;
   const promises = new Set();
   const update = (id, patch) => store.updateJob(storeDir, id, { ...patch, updatedAt: new Date().toISOString() });
   const cancel = (job, status = 'cancelled') => {
@@ -115,12 +117,23 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
         return store.admitJob(storeDir, { request: { ...request, queue: null, lifetime: job.request.lifetime }, ownerId: job.ownerId, projectRoot: job.projectRoot, cwd: job.cwd, parentId: job.id });
       },
       getChild: async id => {
-        while (!controller.signal.aborted) {
-          const child = store.getJob(storeDir, id);
-          if (terminal.has(child.status)) return child;
-          await delay(pollMs);
+        waiting.set(job.id, (waiting.get(job.id) ?? 0) + 1);
+        try {
+          while (!controller.signal.aborted) {
+            const child = store.getJob(storeDir, id);
+            if (terminal.has(child.status)) return child;
+            await delay(pollMs);
+          }
+          throw new Error('parent cancelled');
+        } finally {
+          const remaining = waiting.get(job.id) - 1;
+          if (remaining > 0) waiting.set(job.id, remaining);
+          else {
+            // Reacquire the parent's slot before synthesis resumes.
+            while (!controller.signal.aborted && occupiedSlots() >= concurrency) await delay(pollMs);
+            waiting.delete(job.id);
+          }
         }
-        throw new Error('parent cancelled');
       },
     };
     const work = (async () => {
@@ -157,7 +170,7 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
       const queued = store.listJobs(storeDir).filter(j => j.status === 'queued' && (!j.handoff || j.handoff.ready === true));
       const busyQueues = new Set([...active.keys()].map(id => store.getJob(storeDir, id).request.queue).filter(Boolean));
       for (const job of queued.reverse()) {
-        if (active.size >= concurrency && !(job.parentId && active.has(job.parentId))) continue;
+        if (occupiedSlots() >= concurrency) continue;
         if (job.request.queue && busyQueues.has(job.request.queue)) continue;
         if (job.parentId && !active.has(job.parentId)) { cancel(job); continue; }
         launch(job);
