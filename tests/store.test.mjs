@@ -175,3 +175,13 @@ test('conditional predecessor is validated, same-owner root and immutable; verdi
   assert.throws(() => admitJob(dir, { ...input, parentId: first.id, condition: '&&', predecessorId: first.id }), /root|child/i);
   assert.throws(() => updateJob(dir, first.id, { verdict: 'perhaps' }), /verdict/i);
 });
+
+test('simultaneous admissions cannot claim the same name and UUID-only jobs remain readable', async t => {
+  const { dir, input } = fixture(t);
+  const legacy = admitJob(dir, input);
+  assert.equal(getJob(dir, legacy.id).name, undefined);
+  const results = await Promise.allSettled(Array.from({ length: 12 }, () => new Promise(resolve => setImmediate(resolve)).then(() => admitJob(dir, { ...input, name: 'act.rock.3' }))));
+  assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+  assert.equal(results.filter(result => result.status === 'rejected' && result.reason.code === 'EEXIST').length, 11);
+  assert.equal(listJobs(dir).length, 2);
+});

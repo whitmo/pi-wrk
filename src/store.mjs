@@ -10,9 +10,11 @@ import { normalizeFocus } from './focus.mjs';
 
 const UUID = /^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i;
 const OWNER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const IMMUTABLE = new Set(['id', 'request', 'ownerId', 'projectRoot', 'cwd', 'createdAt', 'parentId', 'lifetime', 'queue', 'focus', 'predecessorId', 'condition']);
+const IMMUTABLE = new Set(['id', 'name', 'request', 'ownerId', 'projectRoot', 'cwd', 'createdAt', 'parentId', 'lifetime', 'queue', 'focus', 'predecessorId', 'condition']);
 const OUTPUT_LIMIT = 1_048_576;
 const QUEUE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
+const NAME = /^[a-z]+\.[a-z]+\.[0-9]$/;
+const ACTIVE = new Set(['queued', 'running', 'routing', 'uncertain']);
 
 function queueName(name) {
   if (typeof name !== 'string' || !QUEUE.test(name) || name.includes('..')) throw new Error('invalid queue name');
@@ -124,6 +126,7 @@ function existingJob(storeDir, id) {
       !isAbsolute(job.projectRoot ?? '') || !isAbsolute(job.cwd ?? '') ||
       typeof job.status !== 'string' || typeof job.createdAt !== 'string' ||
       typeof job.updatedAt !== 'string' || !job.request || typeof job.request !== 'object' ||
+      (job.name != null && !NAME.test(job.name)) ||
       (job.parentId != null && !UUID.test(job.parentId)) ||
       (job.predecessorId != null && !UUID.test(job.predecessorId)) ||
       (job.condition != null && !['&&', '||', '~&&', '~||'].includes(job.condition)) ||
@@ -149,8 +152,9 @@ export function storePath(projectRoot) {
   return join(resolve(projectRoot), '.agents', 'wrk');
 }
 
-export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, handoff, parentId, focus, predecessorId, condition } = {}) {
+export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, handoff, parentId, focus, predecessorId, condition, name } = {}) {
   ownerId(owner);
+  if (name !== undefined && (typeof name !== 'string' || !NAME.test(name))) throw new Error('invalid work-item name');
   const parent = parentId !== undefined ? existingJob(storeDir, jobId(parentId)) : undefined;
   if (condition !== undefined || predecessorId !== undefined) {
     if (parent || !['&&', '||', '~&&', '~||'].includes(condition) || predecessorId === undefined)
@@ -176,23 +180,45 @@ export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, 
     }
   }
   const jobs = folder(storeDir, 'jobs');
-  for (const name of ['cancels', 'owners', 'output', 'notices', 'verdicts']) folder(storeDir, name);
+  for (const folderName of ['cancels', 'owners', 'output', 'notices', 'verdicts']) folder(storeDir, folderName);
   const now = new Date().toISOString();
   for (let attempt = 0; attempt < 5; attempt++) {
     const id = randomUUID();
     const job = { id, request, ownerId: owner, projectRoot: resolve(projectRoot), cwd: resolve(cwd),
       status: 'queued', createdAt: now, updatedAt: now };
+    if (name !== undefined) job.name = name;
     if (focus !== undefined) job.focus = focus;
     if (handoff !== undefined) job.handoff = handoff;
     if (parentId !== undefined) job.parentId = parentId;
     if (condition !== undefined) { job.condition = condition; job.predecessorId = predecessorId; }
+    const claim = name === undefined ? null : location(storeDir, 'names', `${name}.yaml`);
+    if (claim) atomic(claim, { id, name }, { exclusive: true });
     try { atomic(join(jobs, `${id}.yaml`), job, { exclusive: true }); return job; }
-    catch (error) { if (error.code !== 'EEXIST') throw error; }
+    catch (error) {
+      if (claim) unlinkSync(claim);
+      if (error.code !== 'EEXIST') throw error;
+    }
   }
   throw new Error('could not allocate unique job id');
 }
 
 export function getJob(storeDir, id) { return existingJob(storeDir, id); }
+
+export function activeJobsByName(storeDir) {
+  const registry = Object.create(null);
+  for (const job of listJobs(storeDir)) if (job.name && ACTIVE.has(job.status)) registry[job.name] = job.id;
+  return registry;
+}
+
+export function resolveJobId(storeDir, reference) {
+  if (UUID.test(reference ?? '')) return jobId(reference);
+  if (typeof reference !== 'string' || !NAME.test(reference)) throw new Error('invalid job reference');
+  const claim = yamlRead(location(storeDir, 'names', `${reference}.yaml`));
+  if (!claim || !UUID.test(claim.id ?? '') || claim.name !== reference) throw new Error(`no active job named ${reference}`);
+  const job = existingJob(storeDir, claim.id);
+  if (job.name !== reference || !ACTIVE.has(job.status)) throw new Error(`no active job named ${reference}`);
+  return job.id;
+}
 
 export function listJobs(storeDir) {
   const jobs = folder(storeDir, 'jobs');
@@ -252,14 +278,18 @@ export function updateJob(storeDir, id, patch) {
   });
 }
 
-export function requestCancel(storeDir, id) {
-  existingJob(storeDir, jobId(id));
-  const path = location(storeDir, 'cancels', `${id}.yaml`);
-  try { atomic(path, { id, requestedAt: new Date().toISOString() }, { exclusive: true }); }
-  catch (error) {
-    if (error.code !== 'EEXIST') throw error;
-    statNoFollow(path);
-  }
+export function requestCancel(storeDir, id, expectedName) {
+  const action = () => {
+    const job = existingJob(storeDir, jobId(id));
+    if (expectedName && (job.name !== expectedName || !ACTIVE.has(job.status))) throw new Error(`no active job named ${expectedName}`);
+    const path = location(storeDir, 'cancels', `${id}.yaml`);
+    try { atomic(path, { id, requestedAt: new Date().toISOString() }, { exclusive: true }); }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      statNoFollow(path);
+    }
+  };
+  return expectedName ? lockedJob(storeDir, id, action) : action();
 }
 export function isCancelRequested(storeDir, id) {
   jobId(id);
