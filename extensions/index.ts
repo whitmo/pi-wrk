@@ -4,6 +4,7 @@ import { dirname, join, resolve } from 'node:path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { captureFocus } from '../src/focus.mjs';
 import { parseInput } from '../src/input-syntax.mjs';
+import { generateName, loadNameWords } from '../src/names.mjs';
 
 type Request = {
   runner: string;
@@ -18,6 +19,7 @@ type Request = {
 type Snapshot = { entryId: string; prompt: string; sessionId: string };
 type Job = {
   id: string;
+  name?: string;
   status: string;
   request: Request;
   ownerId: string;
@@ -44,12 +46,13 @@ type Pi = Pick<ExtensionAPI, 'registerCommand' | 'on'>;
 type Dependencies = {
   parseRequest(text: string, options: { alias: string }): Request;
   storePath(root: string): string;
-  admitJob(dir: string, input: { request: Request; ownerId: string; projectRoot: string; cwd: string; handoff?: Job['handoff']; focus?: unknown; predecessorId?: string; condition?: Request['condition'] }): Job;
+  admitJob(dir: string, input: { request: Request; ownerId: string; projectRoot: string; cwd: string; handoff?: Job['handoff']; focus?: unknown; predecessorId?: string; condition?: Request['condition']; name?: string }): Job;
   listJobs(dir: string): Job[];
   listQueues?(dir: string): Array<{ name: string }>;
   getJob(dir: string, id: string): Job;
+  resolveJobId?(dir: string, reference: string): string;
   updateJob(dir: string, id: string, patch: Partial<Job>): Job;
-  requestCancel(dir: string, id: string): void;
+  requestCancel(dir: string, id: string, expectedName?: string): void;
   readJobOutput(dir: string, id: string): string;
   readNotices(dir: string, ownerId: string): Array<{ id?: string; jobId: string; message: string; kind?: string; createdAt?: string }>;
   writeNotice?(dir: string, notice: { ownerId: string; jobId: string; message: string; kind: string }): void;
@@ -81,6 +84,9 @@ function userText(content: unknown): string | undefined {
 
 /** Bind only Pi command/event handlers. External dependencies remain injectable for host-free tests. */
 export function createExtension(pi: Pi, deps: Dependencies): void {
+  const words = loadNameWords(new URL('../docs/sorted_short_words.csv', import.meta.url));
+  const generateWorkItemName = () => generateName(words);
+  const display = (job: Job) => job.name ? `${job.name} ${job.id}` : job.id;
   let active: { sessionId: string; ownerId: string; dir: string; timer: ReturnType<typeof setInterval>; lastRootId?: string } | undefined;
   let turn: { sessionId: string; prompt: string; toolSeen: boolean; outcome?: string } | undefined;
   let pending: { jobId: string; snapshot: Snapshot; dir: string; ownerId: string; ctx: Context; outcome?: string; toolSeen: boolean } | undefined;
@@ -98,7 +104,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     const { dir, jobId, ownerId, ctx } = pending;
     const job = deps.getJob(dir, jobId);
     deps.updateJob(dir, jobId, { handoff: { ...job.handoff!, ready: false, reason } });
-    if (current(ctx)?.ownerId === ownerId) notify(ctx, `Handoff ${jobId} blocked: ${reason}`, 'warning');
+    if (current(ctx)?.ownerId === ownerId) notify(ctx, `Handoff ${display(job)} blocked: ${reason}`, 'warning');
     pending = undefined;
   }
   function start(dir: string, job: Job, ctx: Context, sessionId: string, ownerId: string) {
@@ -141,18 +147,27 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
         ctx.sessionManager.getBranch(), root, ctx.cwd, request.focusMode, process.env.PI_WRK_FOCUS_EXTENSION,
       );
       if (request.condition && !session.lastRootId) throw new Error('No predecessor root job in this session');
-      const job = deps.admitJob(dir, {
-        request, ownerId: session.ownerId,
-        ...(request.condition ? { condition: request.condition, predecessorId: session.lastRootId } : {}),
-        projectRoot: root, cwd: resolve(ctx.cwd), ...(handoff ? { handoff } : {}),
-        ...(focus ? { focus } : {}),
-      });
+      let job: Job | undefined;
+      for (let attempt = 0; attempt < 30; attempt++) {
+        try {
+          job = deps.admitJob(dir, {
+            name: generateWorkItemName(), request, ownerId: session.ownerId,
+            ...(request.condition ? { condition: request.condition, predecessorId: session.lastRootId } : {}),
+            projectRoot: root, cwd: resolve(ctx.cwd), ...(handoff ? { handoff } : {}),
+            ...(focus ? { focus } : {}),
+          });
+          break;
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        }
+      }
+      if (!job) throw new Error('could not allocate unique work-item name after 30 attempts');
       session.lastRootId = job.id;
       if (handoff) {
         pending = { jobId: job.id, dir, ownerId: session.ownerId, ctx, snapshot: handoff.snapshot, toolSeen: false };
         ctx.abort();
       }
-      notify(ctx, `${job.id} queued (${request.lifetime})${handoff ? '; handoff awaiting settlement' : ''}`);
+      notify(ctx, `${display(job)} queued (${request.lifetime})${handoff ? '; handoff awaiting settlement' : ''}`);
       start(dir, job, ctx, session.sessionId, session.ownerId);
       return true;
     } catch (error) {
@@ -176,20 +191,22 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       if (!args.trim() || verb === 'jobs') {
         if (id) throw new Error('Usage: /wrk jobs');
         const jobs = deps.listJobs(dir);
-        notify(ctx, jobs.length ? jobs.map((job) => `${job.id} ${job.status}${job.condition ? ` (${job.condition} after ${job.predecessorId})` : ''}${job.handoff && !job.handoff.ready ? ` (handoff blocked: ${job.handoff.reason})` : ''}`).join('\n') : 'No jobs');
+        notify(ctx, jobs.length ? jobs.map((job) => `${display(job)} ${job.status}${job.condition ? ` (${job.condition} after ${job.predecessorId})` : ''}${job.handoff && !job.handoff.ready ? ` (handoff blocked: ${job.handoff.reason})` : ''}`).join('\n') : 'No jobs');
         return;
       }
       if (['status', 'output', 'cancel'].includes(verb)) {
         if (!id || extra) throw new Error(`Usage: /wrk ${verb} <id>`);
-        const job = deps.getJob(dir, id);
+        const resolved = deps.resolveJobId ? deps.resolveJobId(dir, id) : id;
+        const job = deps.getJob(dir, resolved);
+        if (id !== resolved && !['queued', 'running', 'routing', 'uncertain'].includes(job.status)) throw new Error(`no active job named ${id}`);
         if (verb === 'cancel') {
-          deps.requestCancel(dir, id);
-          notify(ctx, `Cancellation requested for ${id}; status remains ${job.status} until worker confirms`);
+          deps.requestCancel(dir, resolved, id !== resolved ? id : undefined);
+          notify(ctx, `Cancellation requested for ${display(job)}; status remains ${job.status} until worker confirms`);
         } else if (verb === 'output') {
-          notify(ctx, deps.readJobOutput(dir, id) || `No output for ${id}`);
+          notify(ctx, deps.readJobOutput(dir, resolved) || `No output for ${display(job)}`);
         } else {
-          const notices = deps.readNotices(dir, job.ownerId).filter((notice) => notice.jobId === id).map((notice) => notice.message);
-          notify(ctx, `${id} ${job.status}${job.condition ? `; ${job.condition} after ${job.predecessorId}` : ''}${job.verdict ? `; verdict ${job.verdict}` : ''}${job.handoff && !job.handoff.ready ? `; handoff blocked: ${job.handoff.reason}` : ''}${job.error ? `; ${job.error}` : ''}${startupErrors.get(dir) ? `; ${startupErrors.get(dir)}` : ''}${notices.length ? `; ${notices.join('; ')}` : ''}`);
+          const notices = deps.readNotices(dir, job.ownerId).filter((notice) => notice.jobId === resolved).map((notice) => notice.message);
+          notify(ctx, `${display(job)} ${job.status}${job.condition ? `; ${job.condition} after ${job.predecessorId}` : ''}${job.verdict ? `; verdict ${job.verdict}` : ''}${job.handoff && !job.handoff.ready ? `; handoff blocked: ${job.handoff.reason}` : ''}${job.error ? `; ${job.error}` : ''}${startupErrors.get(dir) ? `; ${startupErrors.get(dir)}` : ''}${notices.length ? `; ${notices.join('; ')}` : ''}`);
         }
         return;
       }
@@ -231,7 +248,9 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
         for (const notice of deps.readNotices(dir, ownerId)) {
           const key = notice.id ?? `${notice.jobId}:${notice.createdAt ?? ''}:${notice.kind ?? ''}:${notice.message}`;
           if (delivered.has(key)) continue;
-          notify(ctx, `${notice.jobId}: ${notice.message}`, notice.kind === 'question' ? 'warning' : notice.kind === 'failed' || notice.kind === 'error' ? 'error' : 'info');
+          let label = notice.jobId;
+          try { label = display(deps.getJob(dir, notice.jobId)); } catch { /* retain durable UUID */ }
+          notify(ctx, `${label}: ${notice.message}`, notice.kind === 'question' ? 'warning' : notice.kind === 'failed' || notice.kind === 'error' ? 'error' : 'info');
           delivered.add(key);
         }
       } catch { /* durable notices remain available through /wrk status */ }
@@ -267,7 +286,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       else {
         const job = deps.getJob(dir, jobId);
         deps.updateJob(dir, jobId, { handoff: { ready: true, snapshot: job.handoff!.snapshot } });
-        notify(ctx, `Handoff ${jobId} ready after foreground settled`);
+        notify(ctx, `Handoff ${display(job)} ready after foreground settled`);
         pending = undefined;
       }
     }
@@ -283,6 +302,7 @@ export default async function extension(pi: ExtensionAPI): Promise<void> {
     parseRequest: (text, options) => request.parseRequest(text, options) as Request,
     storePath: store.storePath,
     admitJob: store.admitJob, listJobs: store.listJobs, listQueues: store.listQueues, getJob: store.getJob,
+    resolveJobId: store.resolveJobId,
     updateJob: store.updateJob, requestCancel: store.requestCancel,
     readJobOutput: store.readJobOutput, readNotices: store.readNotices,
     writeNotice: store.writeNotice, touchOwner: store.touchOwner,

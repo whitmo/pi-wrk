@@ -4,6 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statS
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parse } from 'yaml';
+import { spawn } from 'node:child_process';
 import {
   storePath, admitJob, listJobs, getJob, updateJob, requestCancel,
   isCancelRequested, touchOwner, closeOwner, ownerAlive, readJobOutput,
@@ -174,6 +175,19 @@ test('conditional predecessor is validated, same-owner root and immutable; verdi
   assert.throws(() => admitJob(dir, { ...input, predecessorId: first.id }), /condition/i);
   assert.throws(() => admitJob(dir, { ...input, parentId: first.id, condition: '&&', predecessorId: first.id }), /root|child/i);
   assert.throws(() => updateJob(dir, first.id, { verdict: 'perhaps' }), /verdict/i);
+});
+
+test('separate sessions claiming the same label produce one durable winner', async t => {
+  const { dir, input } = fixture(t);
+  const script = `import { admitJob } from ${JSON.stringify(new URL('../src/store.mjs', import.meta.url).href)};\ntry { admitJob(process.argv[1], JSON.parse(process.argv[2])); process.exit(0); } catch (error) { process.exit(error.code === 'EEXIST' ? 2 : 3); }`;
+  const submit = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script, dir, JSON.stringify({ ...input, name: 'act.rock.8' })]);
+    child.on('error', reject);
+    child.on('exit', resolve);
+  });
+  const exits = await Promise.all(Array.from({ length: 4 }, submit));
+  assert.deepEqual(exits.sort(), [0, 2, 2, 2]);
+  assert.equal(listJobs(dir).length, 1);
 });
 
 test('simultaneous admissions cannot claim the same name and UUID-only jobs remain readable', async t => {

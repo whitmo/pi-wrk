@@ -143,7 +143,7 @@ export function createRunners({ piCommand = 'pi', definitions, availableModels, 
     if (model && !models.includes(model)) throw new Error(`unknown model: ${model}`);
     const args = ['--mode', 'json', '--no-extensions', '--no-session', '--offline'];
     const focus = normalizeFocus(job.focus);
-    const env = context.storeDir ? { ...process.env, PI_WRK_STORE: context.storeDir, PI_WRK_JOB_ID: job.id } : undefined;
+    const env = context.storeDir ? { ...process.env, PI_WRK_STORE: context.storeDir, PI_WRK_JOB_ID: job.id, ...(job.name ? { PI_WRK_JOB_NAME: job.name } : {}) } : undefined;
     if (focus?.mode === 'active') {
       const { prepareFocusActivation } = await import('./focus-runtime.mjs');
       await prepareFocusActivation(focus);

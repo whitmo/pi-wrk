@@ -241,3 +241,16 @@ test('unrecorded default runs before scoped candidates and abort during invocati
   await assert.rejects(cancelled.agent(job('agent', 'work', scoped), ctx(controller.signal)));
   assert.equal(calls, 1);
 });
+
+test('worker identity uses job label metadata without replacing explicit agent definition selection', async () => {
+  const calls = [];
+  const runners = createRunners({ definitions: { reviewer: { prompt: 'Review carefully' } }, invoke: async (_cmd, args, config) => {
+    calls.push({ args, config });
+    return { code: 0, output: '{"type":"agent_settled"}', stream: { settled: true, assistant: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'reviewed' }] } } };
+  } });
+  const work = job('agent', 'check', { name: 'reviewer' });
+  work.name = 'act.rock.4';
+  await runners.agent(work, { ...ctx(), storeDir: '/tmp/wrk' });
+  assert.equal(calls[0].config.env.PI_WRK_JOB_NAME, 'act.rock.4');
+  assert.ok(calls[0].args.includes('Review carefully'));
+});

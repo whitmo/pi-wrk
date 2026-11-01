@@ -503,3 +503,24 @@ test('uncertain predecessor visibly skips conditional successor without starting
     assert.equal(launches, 0);
   } finally { await worker.stop(); }
 });
+
+test('detached worker gives each routed child a different name and carries it into agent metadata', async () => {
+  const f = fixture([{ id: 'route', name: 'act.rock.0', request: { runner: 'router' } }]);
+  const seen = [];
+  const worker = await running(f, {
+    router: async (_job, context) => {
+      const one = context.submitChild({ runner: 'agent', prompt: 'one', options: {} });
+      const two = context.submitChild({ runner: 'agent', prompt: 'two', options: {} });
+      await Promise.all([context.getChild(one.id), context.getChild(two.id)]);
+      return { summary: 'done' };
+    },
+    agent: async job => { seen.push(job); return { summary: 'done' }; },
+  });
+  try {
+    await until(() => f.items.get('route').status === 'succeeded');
+    assert.equal(seen.length, 2);
+    assert.match(seen[0].name, /^[a-z]+\.[a-z]+\.[0-9]$/);
+    assert.notEqual(seen[0].name, seen[1].name);
+    assert.equal(seen[0].request.options.name, undefined);
+  } finally { await worker.stop(); }
+});

@@ -6,6 +6,7 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
 import { createRunners } from './runners.mjs';
+import { admitNamedJob, loadNameWords } from './names.mjs';
 import { createSwarmWorkspaces } from './workspaces.mjs';
 import YAML from 'yaml';
 
@@ -112,6 +113,7 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
   if (!Number.isInteger(concurrency) || concurrency < 1) throw new Error('concurrency must be positive');
   const injectedStore = Boolean(store);
   store ??= await import('./store.mjs');
+  const words = loadNameWords(new URL('../docs/sorted_short_words.csv', import.meta.url));
   const defaultRunners = !runners;
   runners ??= createRunners();
   const release = injectedStore ? null : await ownWorker(storeDir);
@@ -122,7 +124,7 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
   const update = (id, patch) => store.updateJob(storeDir, id, { ...patch, updatedAt: new Date().toISOString() });
   const notice = job => {
     try { store.writeNotice(storeDir, { ownerId: job.ownerId, jobId: job.id,
-      message: `${job.id}: ${job.status}${job.summary ? ` — ${job.summary}` : ''}${job.error ? `: ${job.error}` : ''}`, kind: job.status }); }
+      message: `${job.name ? `${job.name} ` : ''}${job.id}: ${job.status}${job.summary ? ` — ${job.summary}` : ''}${job.error ? `: ${job.error}` : ''}`, kind: job.status }); }
     catch (error) { console.error(`notice for ${job.id} unavailable: ${errorText(error)}`); }
   };
   const cancel = (job, status = 'cancelled') => notice(update(job.id, { status, finishedAt: new Date().toISOString() }));
@@ -145,7 +147,7 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
         if (!['agent', 'council', 'swarm'].includes(request.runner) || job.parentId && request.runner !== 'agent') throw new Error('invalid child runner or depth');
         if (workspace && !allowedWorkspaces.has(workspace) || job.request.runner === 'swarm' && !workspace) throw new Error('unregistered child workspace');
         if (workspace) allowedWorkspaces.delete(workspace);
-        const child = store.admitJob(storeDir, { request: { ...request, queue: null, lifetime: job.request.lifetime }, ownerId: job.ownerId, projectRoot: workspace?.projectRoot ?? job.projectRoot, cwd: workspace?.cwd ?? job.cwd, parentId: job.id, ...(job.focus ? { focus: job.focus } : {}) });
+        const child = admitNamedJob(storeDir, { request: { ...request, queue: null, lifetime: job.request.lifetime }, ownerId: job.ownerId, projectRoot: workspace?.projectRoot ?? job.projectRoot, cwd: workspace?.cwd ?? job.cwd, parentId: job.id, ...(job.focus ? { focus: job.focus } : {}) }, words, undefined, store.admitJob);
         return workspace ? update(child.id, { workspace: { branch: workspace.branch, path: workspace.projectRoot } }) : child;
       },
       getChild: async id => {

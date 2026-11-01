@@ -375,3 +375,44 @@ test('submission captures selected model and ordered scoped models without repla
     tools: 'read', model: 'explicit/model', defaultModel: 'alpha/one', scopedModels: ['beta/two', 'gamma/three'],
   });
 });
+
+test('root names appear beside UUID and resolve only while active; UUID history remains accessible', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-label-ui-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = store.storePath(root);
+  const h = harness({ realStore: dir });
+  await h.event('session_start');
+  await h.command('bg', 'labeled');
+  const [job] = store.listJobs(dir);
+  assert.match(job.name, /^[a-z]+\.[a-z]+\.[0-9]$/);
+  assert.match(h.ui.at(-1).message, new RegExp(`${job.name.replaceAll('.', '\\.')}.*${job.id}`));
+  await h.command('wrk', 'jobs');
+  assert.match(h.ui.at(-1).message, new RegExp(`${job.name.replaceAll('.', '\\.')}.*${job.id}`));
+  await h.command('wrk', `status ${job.name}`);
+  assert.match(h.ui.at(-1).message, /queued/);
+  store.appendJobOutput(dir, job.id, 'work in progress');
+  await h.command('wrk', `output ${job.name}`);
+  assert.equal(h.ui.at(-1).message, 'work in progress');
+  await h.command('wrk', `cancel ${job.name}`);
+  assert.equal(store.isCancelRequested(dir, job.id), true);
+  store.updateJob(dir, job.id, { status: 'succeeded' });
+  await h.command('wrk', `status ${job.name}`);
+  assert.match(h.ui.at(-1).message, /no active job/i);
+  await h.command('wrk', `status ${job.id}`);
+  assert.match(h.ui.at(-1).message, /succeeded/);
+});
+
+test('label cancellation rejects a job completed after resolution', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-race-ui-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = store.storePath(root);
+  const job = store.admitJob(dir, { name: 'act.rock.2', ownerId: 'owner-1', projectRoot: root, cwd: root, request: { runner: 'agent', prompt: 'race', lifetime: 'session' } });
+  const h = harness({ realStore: dir });
+  await h.event('session_start');
+  // Completion occurs after name resolution but before the cancellation claim.
+  // Direct store check is the race boundary: it must reject even with a previously resolved UUID.
+  const resolved = store.resolveJobId(dir, job.name);
+  store.updateJob(dir, job.id, { status: 'succeeded' });
+  assert.throws(() => store.requestCancel(dir, resolved, job.name), /no active job/i);
+  assert.equal(store.isCancelRequested(dir, job.id), false);
+});
