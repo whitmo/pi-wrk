@@ -60,7 +60,6 @@ function harness({ startup = () => Promise.resolve(), parser, realStore } = {}) 
   return { command, event, ctx, jobs, ui, branch, notices, tick: () => heartbeat?.(), get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
 }
 
-const flush = () => new Promise((resolve) => setImmediate(resolve));
 
 test('submission persists current focus before queueing and respects later clear and opt-out', async t => {
   const { entry } = await import('./fixtures/focus.mjs');
@@ -87,7 +86,7 @@ test('submission persists current focus before queueing and respects later clear
 });
 
 test('busy primary admits /bg durably without waiting, aborting, or sending foreground input', async () => {
-  const h = harness({ startup: () => new Promise(() => {}) });
+  const h = harness();
   h.busy(true);
   await h.event('session_start');
   await h.command('bg', 'fix report');
@@ -129,15 +128,26 @@ test('heartbeat delivers durable questions once without foreground work or stale
   assert.equal(h.notices.length, 2);
 });
 
-test('startup failure is visible on status and a durable notice, not reported as running', async () => {
-  const h = harness({ startup: () => Promise.reject(new Error('worker failed to bind')) });
+test('admission waits for worker readiness, including an in-flight startup', async () => {
+  let ready;
+  const h = harness({ startup: () => new Promise(resolve => { ready = resolve; }) });
+  await h.event('session_start');
+  const submitting = h.command('bg', 'check');
+  assert.equal(h.jobs.size, 0);
+  ready();
+  await submitting;
+  assert.equal(h.jobs.size, 1);
+});
+
+test('incompatible live worker prevents admission on command and inline input', async () => {
+  const h = harness({ startup: () => Promise.reject(new Error('Worker protocol mismatch: let active jobs drain, stop the old worker, then restart pi-wrk and retry')) });
   await h.event('session_start');
   await h.command('&', 'check');
-  await flush();
-  assert.equal(h.jobs.values().next().value.status, 'queued');
-  await h.command('wrk', 'status job-1');
-  assert.match(h.ui.at(-1).message, /worker failed to bind/);
-  assert.doesNotMatch(h.ui.at(-1).message, /running/i);
+  assert.equal(h.jobs.size, 0);
+  assert.match(h.ui.at(-1).message, /drain.*restart/i);
+  assert.deepEqual(await h.event('input', { text: 'check &', source: 'interactive' }), { action: 'handled' });
+  assert.equal(h.jobs.size, 0);
+  assert.equal(h.starts, 2);
 });
 
 test('/wrk routes inspection and cancellation without admitting another job', async () => {

@@ -90,7 +90,6 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   let active: { sessionId: string; ownerId: string; dir: string; timer: ReturnType<typeof setInterval>; lastRootId?: string } | undefined;
   let turn: { sessionId: string; prompt: string; toolSeen: boolean; outcome?: string } | undefined;
   let pending: { jobId: string; snapshot: Snapshot; dir: string; ownerId: string; ctx: Context; outcome?: string; toolSeen: boolean } | undefined;
-  const startupErrors = new Map<string, string>();
 
   function current(ctx: Context) {
     if (active?.sessionId === ctx.sessionManager.getSessionId()) return active;
@@ -107,19 +106,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     if (current(ctx)?.ownerId === ownerId) notify(ctx, `Handoff ${display(job)} blocked: ${reason}`, 'warning');
     pending = undefined;
   }
-  function start(dir: string, job: Job, ctx: Context, sessionId: string, ownerId: string) {
-    // Deliberately not awaited: a command receipt means durable admission, not worker readiness.
-    void Promise.resolve().then(() => deps.ensureWorker(dir)).catch((error: unknown) => {
-      const message = `Worker startup failed: ${error instanceof Error ? error.message : String(error)}`;
-      startupErrors.set(dir, message);
-      try { deps.writeNotice?.(dir, { ownerId, jobId: job.id, message, kind: 'error' }); } catch { /* status remains readable */ }
-      if (current(ctx)?.ownerId === ownerId && ctx.sessionManager.getSessionId() === sessionId) {
-        ctx.ui.setStatus('wrk', message);
-        notify(ctx, message, 'error');
-      }
-    });
-  }
-  function submit(alias: string, args: string, ctx: Context, model?: string): boolean {
+  async function submit(alias: string, args: string, ctx: Context, model?: string): Promise<boolean> {
     try {
       const session = current(ctx);
       if (!session) throw new Error('Session owner unavailable; retry after session start');
@@ -147,6 +134,8 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
         ctx.sessionManager.getBranch(), root, ctx.cwd, request.focusMode, process.env.PI_WRK_FOCUS_EXTENSION,
       );
       if (request.condition && !session.lastRootId) throw new Error('No predecessor root job in this session');
+      await deps.ensureWorker(dir);
+      if (current(ctx) !== session) throw new Error('Session changed while starting worker; retry submission');
       let job: Job | undefined;
       for (let attempt = 0; attempt < 30; attempt++) {
         try {
@@ -168,14 +157,13 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
         ctx.abort();
       }
       notify(ctx, `${display(job)} queued (${request.lifetime})${handoff ? '; handoff awaiting settlement' : ''}`);
-      start(dir, job, ctx, session.sessionId, session.ownerId);
       return true;
     } catch (error) {
       notify(ctx, error instanceof Error ? error.message : String(error), 'error');
       return false;
     }
   }
-  function manage(args: string, ctx: Context) {
+  async function manage(args: string, ctx: Context) {
     const session = current(ctx);
     if (!session) { notify(ctx, 'Session owner unavailable', 'error'); return; }
     const [verb, id, extra] = args.trim().split(/\s+/);
@@ -206,27 +194,27 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
           notify(ctx, deps.readJobOutput(dir, resolved) || `No output for ${display(job)}`);
         } else {
           const notices = deps.readNotices(dir, job.ownerId).filter((notice) => notice.jobId === resolved).map((notice) => notice.message);
-          notify(ctx, `${display(job)} ${job.status}${job.condition ? `; ${job.condition} after ${job.predecessorId}` : ''}${job.verdict ? `; verdict ${job.verdict}` : ''}${job.handoff && !job.handoff.ready ? `; handoff blocked: ${job.handoff.reason}` : ''}${job.error ? `; ${job.error}` : ''}${startupErrors.get(dir) ? `; ${startupErrors.get(dir)}` : ''}${notices.length ? `; ${notices.join('; ')}` : ''}`);
+          notify(ctx, `${display(job)} ${job.status}${job.condition ? `; ${job.condition} after ${job.predecessorId}` : ''}${job.verdict ? `; verdict ${job.verdict}` : ''}${job.handoff && !job.handoff.ready ? `; handoff blocked: ${job.handoff.reason}` : ''}${job.error ? `; ${job.error}` : ''}${notices.length ? `; ${notices.join('; ')}` : ''}`);
         }
         return;
       }
-      submit('wrk', args, ctx);
+      await submit('wrk', args, ctx);
     } catch (error) { notify(ctx, error instanceof Error ? error.message : String(error), 'error'); }
   }
 
-  pi.registerCommand('&', { description: 'Submit work asynchronously', handler: async (args, ctx) => { submit('&', args, ctx); } });
-  pi.registerCommand('bg', { description: 'Submit to a background agent', handler: async (args, ctx) => { submit('bg', args, ctx); } });
+  pi.registerCommand('&', { description: 'Submit work asynchronously', handler: async (args, ctx) => { await submit('&', args, ctx); } });
+  pi.registerCommand('bg', { description: 'Submit to a background agent', handler: async (args, ctx) => { await submit('bg', args, ctx); } });
   for (const condition of ['&&', '||', '~&&', '~||'])
-    pi.registerCommand(condition, { description: `Submit conditional background job (${condition})`, handler: async (args, ctx) => { submit(condition, args, ctx); } });
+    pi.registerCommand(condition, { description: `Submit conditional background job (${condition})`, handler: async (args, ctx) => { await submit(condition, args, ctx); } });
   pi.registerCommand('wrk', { description: 'Submit or inspect background jobs', handler: async (args, ctx) => manage(args, ctx) });
 
-  pi.on('input', (event, ctx) => {
+  pi.on('input', async (event, ctx) => {
     if (event.source === 'extension') return { action: 'continue' };
     try {
       const syntax = parseInput(event.text);
       if (!syntax) return { action: 'continue' };
       if (event.images?.length) throw new Error('Background input cannot include images');
-      if (!submit(syntax.alias, syntax.args, ctx, syntax.model)) return { action: 'handled' };
+      if (!await submit(syntax.alias, syntax.args, ctx, syntax.model)) return { action: 'handled' };
       return syntax.foreground ? { action: 'transform', text: syntax.foreground } : { action: 'handled' };
     } catch (error) {
       notify(ctx, error instanceof Error ? error.message : String(error), 'error');

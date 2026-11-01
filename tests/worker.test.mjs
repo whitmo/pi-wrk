@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync, utimesSync, existsSync, readFileSyn
 import { admitJob, getJob, readJobOutput, requestCancel, touchOwner } from '../src/store.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { randomUUID, createHash } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { runWorker, ensureWorker } from '../src/worker.mjs';
@@ -200,7 +200,26 @@ test('CLI rejects relative worker store and invalid job ids', () => {
   assert.match(relative.stderr, /absolute/);
   const invalid = spawnSync(process.execPath, [bin, 'status', '../escape', '--store', '/tmp/wrk-no-store'], { encoding: 'utf8' });
   assert.notEqual(invalid.status, 0);
-  assert.match(invalid.stderr, /invalid job id/);
+  assert.match(invalid.stderr, /invalid job reference/);
+});
+
+test('CLI lists labels with UUIDs, keeps legacy UUIDs, and resolves active labels', t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-cli-names-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'wrk');
+  const input = { ownerId: 'owner', projectRoot: root, cwd: root, request: { runner: 'agent', prompt: 'work', lifetime: 'independent' } };
+  const named = admitJob(dir, { ...input, name: 'act.rock.2' });
+  const legacy = admitJob(dir, input);
+  const bin = new URL('../bin/pi-wrk.mjs', import.meta.url).pathname;
+  const cli = (...args) => spawnSync(process.execPath, [bin, ...args, '--store', dir], { encoding: 'utf8' });
+  const listed = cli('jobs');
+  assert.equal(listed.status, 0);
+  assert.match(listed.stdout, new RegExp(`act\\.rock\\.2 ${named.id}`));
+  assert.match(listed.stdout, new RegExp(`^${legacy.id} `, 'm'));
+  assert.equal(cli('status', named.name).status, 0);
+  assert.equal(cli('output', named.name).status, 0);
+  assert.equal(cli('cancel', named.name).status, 0);
+  assert.equal(cli('status', legacy.id).status, 0);
 });
 
 test('real store shell job records output, exit and cancellation', async () => {
@@ -340,6 +359,15 @@ test('detached worker executes durable admission and reconnects without duplicat
     await ensureWorker(dir, options);
     await Promise.all([ensureWorker(dir, options), ensureWorker(dir, options)]);
     assert.equal(children.length, 1);
+    const lock = join(dir, 'worker.lock');
+    const healthy = readFileSync(lock, 'utf8');
+    for (const incompatible of [healthy.replace(/protocolVersion:.*\n/, ''), healthy.replace(/protocolVersion:.*\n/, 'protocolVersion: 0\n')]) {
+      writeFileSync(lock, incompatible);
+      await assert.rejects(ensureWorker(dir, options), /restart.*drain|drain.*restart/i);
+      assert.equal(children.length, 1, 'incompatible live worker must not be terminated or replaced');
+    }
+    writeFileSync(lock, healthy);
+    await ensureWorker(dir, options);
     await until(() => getJob(dir, job.id).status === 'succeeded');
     assert.equal(readJobOutput(dir, job.id), 'detached-ok');
   } finally {
@@ -387,6 +415,30 @@ test('detached worker waits out a recent unverifiable lock and becomes ready', a
       await closed;
     }
     rmSync(temp, { recursive: true, force: true });
+  }
+});
+
+test('ensureWorker rejects an incompatible worker appearing during startup', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wrk-old-start-'));
+  const sock = join('/tmp', `pi-wrk-${process.getuid()}`, `${createHash('sha256').update(dir).digest('hex').slice(0, 32)}.sock`);
+  const script = `const fs = require('node:fs'); const net = require('node:net');
+    fs.mkdirSync(require('node:path').dirname(${JSON.stringify(sock)}), { recursive: true, mode: 0o700 });
+    try { fs.unlinkSync(${JSON.stringify(sock)}); } catch {}
+    const server = net.createServer(connection => connection.end('old-token\\n'));
+    server.listen(${JSON.stringify(sock)}, () => fs.writeFileSync(${JSON.stringify(join(dir, 'worker.lock'))}, 'token: old-token\\nstartedAt: 1\\n'));`;
+  let child;
+  try {
+    await assert.rejects(ensureWorker(dir, { timeoutMs: 3000, spawnWorker: () => {
+      child = spawn(process.execPath, ['-e', script], { stdio: 'ignore' });
+      return child;
+    } }), /restart.*drain|drain.*restart/i);
+    assert.equal(child.exitCode, null);
+  } finally {
+    if (child?.exitCode === null && child.signalCode === null) {
+      child.ref(); const closed = once(child, 'close'); child.kill('SIGTERM'); await closed;
+    }
+    rmSync(dir, { recursive: true, force: true });
+    rmSync(sock, { force: true });
   }
 });
 

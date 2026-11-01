@@ -10,7 +10,7 @@ test('CSV categories include either order, exclude proper names and articles, an
   const dir = mkdtempSync(join(tmpdir(), 'wrk-words-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const path = join(dir, 'words.csv');
-  writeFileSync(path, 'Word,Size,Part of Speech\nact,3,Noun / Verb\nact,3,Verb / Noun\nbake,4,Verb\nrock,4,Noun\nAda,3,Noun (Proper / Name)\na,1,Article / Determiner\nhe,2,Pronoun\ninvalid,2,Verb\n');
+  writeFileSync(path, 'Word,Size,Part of Speech\nact,3,Noun / Verb\nact,3,Verb / Noun\nbake,4,Verb\nrock,4,Noun\nfake,4,Verb,extra\nAda,3,Noun (Proper / Name)\na,1,Article / Determiner\nhe,2,Pronoun\ninvalid,2,Verb\n');
   const words = loadNameWords(path);
   assert.deepEqual(words.verbs, ['act', 'bake']);
   assert.deepEqual(words.nouns, ['act', 'rock']);

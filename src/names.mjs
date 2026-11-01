@@ -7,7 +7,7 @@ export function loadNameWords(path) {
   const rows = readFileSync(path, 'utf8').replace(/^\uFEFF/, '').split(/\r?\n/);
   if (rows.shift() !== 'Word,Size,Part of Speech') throw new Error('invalid work-item words header');
   for (const row of rows) {
-    const match = /^([^,]+),(\d+),(.+)$/.exec(row);
+    const match = /^([^,]+),(\d+),([^,]+)$/.exec(row);
     if (!match) continue;
     const [, raw, size, part] = match;
     const word = raw.toLowerCase();

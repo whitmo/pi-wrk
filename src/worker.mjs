@@ -12,6 +12,8 @@ import YAML from 'yaml';
 
 const terminal = new Set(['succeeded', 'failed', 'cancelled', 'interrupted', 'skipped']);
 const lockName = 'worker.lock';
+const protocolVersion = 2; // Named root and child jobs require a worker from this release.
+const incompatibleWorker = () => new Error('Worker protocol mismatch: let active jobs drain, stop the old worker, then restart pi-wrk and retry');
 function conditionMatches(job, predecessor) {
   if (job.condition === '&&') return predecessor.status === 'succeeded';
   if (job.condition === '||') return predecessor.status === 'failed';
@@ -54,7 +56,10 @@ export async function ensureWorker(storeDir, { workerCommand = process.execPath,
   storeDir = resolve(storeDir);
   mkdirSync(storeDir, { recursive: true, mode: 0o700 });
   const existing = identity(storeDir);
-  if (existing && await ping(storeDir, existing.token)) return;
+  if (existing && await ping(storeDir, existing.token)) {
+    if (existing.protocolVersion !== protocolVersion) throw incompatibleWorker();
+    return;
+  }
   const log = openSync(join(storeDir, 'worker.log'), 'a', 0o600);
   let child;
   try {
@@ -69,7 +74,10 @@ export async function ensureWorker(storeDir, { workerCommand = process.execPath,
   while (Date.now() < until) {
     if (spawnError) throw new Error(`worker startup failed: ${spawnError.message}`);
     const current = identity(storeDir);
-    if (current && await ping(storeDir, current.token, 100)) return;
+    if (current && await ping(storeDir, current.token, 100)) {
+      if (current.protocolVersion !== protocolVersion) throw incompatibleWorker();
+      return;
+    }
     if (child.exitCode !== null) throw new Error(`worker exited during startup: ${child.exitCode}; see worker.log`);
     await delay(50);
   }
@@ -84,7 +92,7 @@ async function ownWorker(storeDir) {
   for (;;) {
     try {
       const fd = openSync(lock, 'wx', 0o600);
-      writeFileSync(fd, YAML.stringify({ pid: process.pid, token, startedAt: Date.now() }));
+      writeFileSync(fd, YAML.stringify({ pid: process.pid, token, protocolVersion, startedAt: Date.now() }));
       closeSync(fd);
       break;
     } catch (error) {
