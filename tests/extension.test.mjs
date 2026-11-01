@@ -364,3 +364,14 @@ test('invalid syntax and failed admission never leak background work into foregr
   assert.match(h.ui.at(-1).message, /image/i);
   assert.equal(h.jobs.size, 0);
 });
+
+test('submission captures selected model and ordered scoped models without replacing request options', async () => {
+  const h = harness({ parser: text => ({ runner: 'agent', prompt: text, options: { tools: 'read', model: 'explicit/model' }, queue: null, lifetime: 'session', handoff: false }) });
+  h.ctx.model = { provider: 'alpha', id: 'one' };
+  h.ctx.scopedModels = [{ model: { provider: 'beta', id: 'two' } }, { model: { provider: 'gamma', id: 'three' } }];
+  await h.event('session_start');
+  await h.command('bg', 'work');
+  assert.deepEqual([...h.jobs.values()][0].request.options, {
+    tools: 'read', model: 'explicit/model', defaultModel: 'alpha/one', scopedModels: ['beta/two', 'gamma/three'],
+  });
+});

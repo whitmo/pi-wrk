@@ -37,6 +37,8 @@ type Context = {
   sessionManager: Session;
   isIdle(): boolean;
   abort(): void;
+  model?: { provider: string; id: string };
+  scopedModels?: readonly { model: { provider: string; id: string } }[];
 };
 type Pi = Pick<ExtensionAPI, 'registerCommand' | 'on'>;
 type Dependencies = {
@@ -117,6 +119,11 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       if (!session) throw new Error('Session owner unavailable; retry after session start');
       const request = deps.parseRequest(args, { alias });
       if (model) request.options = { ...request.options, model };
+      if (request.runner !== 'shell') request.options = {
+        ...request.options,
+        ...(ctx.model ? { defaultModel: `${ctx.model.provider}/${ctx.model.id}` } : {}),
+        scopedModels: (ctx.scopedModels ?? []).map(({ model }) => `${model.provider}/${model.id}`),
+      };
       let handoff: Job['handoff'];
       if (request.handoff) {
         if (pending) throw new Error('An earlier handoff is still settling');
