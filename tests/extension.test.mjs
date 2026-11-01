@@ -320,3 +320,47 @@ test('rapid conditional admissions bind only preceding root from same session', 
   assert.equal(store.listJobs(dir).find(j => j.request.prompt === 'other followup').predecessorId,
     store.listJobs(dir).find(j => j.request.prompt === 'other').id);
 });
+
+test('composer prefix routes through /& and conditional commands, never the foreground', async () => {
+  const { parseRequest } = await import('../src/request.mjs');
+  const h = harness({ parser: parseRequest });
+  await h.event('session_start');
+  assert.deepEqual(await h.event('input', { text: '& first', source: 'interactive' }), { action: 'handled' });
+  assert.deepEqual(await h.event('input', { text: '&& second', source: 'interactive' }), { action: 'handled' });
+  assert.deepEqual(await h.event('input', { text: '~|| third', source: 'interactive' }), { action: 'handled' });
+  assert.equal(h.jobs.size, 3);
+  assert.equal(h.jobs.get('job-1').request.runner, 'router');
+  assert.equal(h.jobs.get('job-2').request.condition, '&&');
+  assert.equal(h.jobs.get('job-2').predecessorId, 'job-1');
+  assert.equal(h.jobs.get('job-3').request.condition, '~||');
+  assert.deepEqual(await h.event('input', { text: '& ignored', source: 'extension' }), { action: 'continue' });
+  assert.equal(h.jobs.size, 3);
+});
+
+test('trailing line and explicit markup admit once, transform only remaining foreground', async () => {
+  const { parseRequest } = await import('../src/request.mjs');
+  const h = harness({ parser: parseRequest });
+  await h.event('session_start');
+  assert.deepEqual(await h.event('input', { text: 'review code &\nWrite a summary', source: 'interactive' }),
+    { action: 'transform', text: 'Write a summary' });
+  assert.equal(h.jobs.get('job-1').request.prompt, 'review code');
+  assert.deepEqual(await h.event('input', { text: 'Before <& type=swarm model="luna 6 xhigh">build it</&> after', source: 'interactive' }),
+    { action: 'transform', text: 'Before  after' });
+  assert.equal(h.jobs.get('job-2').request.runner, 'swarm');
+  assert.equal(h.jobs.get('job-2').request.prompt, 'build it');
+  assert.equal(h.jobs.get('job-2').request.options.model, 'luna 6 xhigh');
+  assert.equal(h.jobs.size, 2);
+});
+
+test('invalid syntax and failed admission never leak background work into foreground', async () => {
+  const { parseRequest } = await import('../src/request.mjs');
+  const h = harness({ parser: parseRequest });
+  await h.event('session_start');
+  assert.deepEqual(await h.event('input', { text: 'Before <& type=swarm model=bad>work</&> after', source: 'interactive' }), { action: 'handled' });
+  assert.match(h.ui.at(-1).message, /invalid|malformed/i);
+  assert.deepEqual(await h.event('input', { text: '&& no predecessor\nforeground', source: 'interactive' }), { action: 'handled' });
+  assert.match(h.ui.at(-1).message, /predecessor/i);
+  assert.deepEqual(await h.event('input', { text: 'task &\nforeground', source: 'interactive', images: [{}] }), { action: 'handled' });
+  assert.match(h.ui.at(-1).message, /image/i);
+  assert.equal(h.jobs.size, 0);
+});

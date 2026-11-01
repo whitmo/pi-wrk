@@ -3,6 +3,7 @@ import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { captureFocus } from '../src/focus.mjs';
+import { parseInput } from '../src/input-syntax.mjs';
 
 type Request = {
   runner: string;
@@ -110,11 +111,12 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       }
     });
   }
-  function submit(alias: string, args: string, ctx: Context) {
+  function submit(alias: string, args: string, ctx: Context, model?: string): boolean {
     try {
       const session = current(ctx);
       if (!session) throw new Error('Session owner unavailable; retry after session start');
       const request = deps.parseRequest(args, { alias });
+      if (model) request.options = { ...request.options, model };
       let handoff: Job['handoff'];
       if (request.handoff) {
         if (pending) throw new Error('An earlier handoff is still settling');
@@ -145,8 +147,10 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       }
       notify(ctx, `${job.id} queued (${request.lifetime})${handoff ? '; handoff awaiting settlement' : ''}`);
       start(dir, job, ctx, session.sessionId, session.ownerId);
+      return true;
     } catch (error) {
       notify(ctx, error instanceof Error ? error.message : String(error), 'error');
+      return false;
     }
   }
   function manage(args: string, ctx: Context) {
@@ -186,11 +190,25 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     } catch (error) { notify(ctx, error instanceof Error ? error.message : String(error), 'error'); }
   }
 
-  pi.registerCommand('&', { description: 'Submit work asynchronously', handler: async (args, ctx) => submit('&', args, ctx) });
-  pi.registerCommand('bg', { description: 'Submit to a background agent', handler: async (args, ctx) => submit('bg', args, ctx) });
+  pi.registerCommand('&', { description: 'Submit work asynchronously', handler: async (args, ctx) => { submit('&', args, ctx); } });
+  pi.registerCommand('bg', { description: 'Submit to a background agent', handler: async (args, ctx) => { submit('bg', args, ctx); } });
   for (const condition of ['&&', '||', '~&&', '~||'])
-    pi.registerCommand(condition, { description: `Submit conditional background job (${condition})`, handler: async (args, ctx) => submit(condition, args, ctx) });
+    pi.registerCommand(condition, { description: `Submit conditional background job (${condition})`, handler: async (args, ctx) => { submit(condition, args, ctx); } });
   pi.registerCommand('wrk', { description: 'Submit or inspect background jobs', handler: async (args, ctx) => manage(args, ctx) });
+
+  pi.on('input', (event, ctx) => {
+    if (event.source === 'extension') return { action: 'continue' };
+    try {
+      const syntax = parseInput(event.text);
+      if (!syntax) return { action: 'continue' };
+      if (event.images?.length) throw new Error('Background input cannot include images');
+      if (!submit(syntax.alias, syntax.args, ctx, syntax.model)) return { action: 'handled' };
+      return syntax.foreground ? { action: 'transform', text: syntax.foreground } : { action: 'handled' };
+    } catch (error) {
+      notify(ctx, error instanceof Error ? error.message : String(error), 'error');
+      return { action: 'handled' };
+    }
+  });
 
   pi.on('session_start', (_event, ctx) => {
     if (active) { deps.clearInterval(active.timer); deps.closeOwner(active.dir, active.ownerId); active = undefined; }
