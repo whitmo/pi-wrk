@@ -179,8 +179,8 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
         if (status === 'uncertain') patch.error = 'termination of descendants not verified; operator resolution required';
         notice(update(job.id, patch));
       } catch (error) {
-        const status = controller.signal.aborted ? (defaultRunners ? 'uncertain' : 'cancelled') : 'failed';
-        notice(update(job.id, { status, error: status === 'uncertain' ? `${errorText(error)}; descendant termination unverified; operator resolution required` : errorText(error), finishedAt: new Date().toISOString() }));
+        const status = controller.signal.aborted ? (defaultRunners ? 'uncertain' : 'cancelled') : error?.uncertain ? 'uncertain' : 'failed';
+        notice(update(job.id, { status, error: status === 'uncertain' ? `${errorText(error)}; ${controller.signal.aborted ? 'descendant termination unverified; ' : ''}operator resolution required` : errorText(error), finishedAt: new Date().toISOString() }));
       } finally { active.delete(job.id); }
     })();
     promises.add(work);

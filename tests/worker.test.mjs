@@ -8,6 +8,7 @@ import { randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { once } from 'node:events';
 import { runWorker, ensureWorker } from '../src/worker.mjs';
+import { createRunners } from '../src/runners.mjs';
 
 function fixture(jobs) {
   const items = new Map(jobs.map(j => [j.id, { status: 'queued', ownerId: 'owner', cwd: process.cwd(), projectRoot: process.cwd(), ...j, request: { runner: 'agent', prompt: j.id, lifetime: j.lifetime ?? 'independent', ...j.request } }]));
@@ -102,6 +103,39 @@ test('cancel running job aborts it and records cancelled only after termination'
     f.cancels.add('running');
     await until(() => f.items.get('running').status === 'cancelled');
     assert.equal(terminated, true);
+  } finally { await worker.stop(); }
+});
+
+test('post-tool failure and ambiguous Pi stream block conditional and unrelated successors', async () => {
+  const started = JSON.stringify({ type: 'tool_execution_start', toolCallId: 'x', toolName: 'bash' });
+  for (const output of [
+    [started, JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'provider failed' } }), JSON.stringify({ type: 'agent_settled' })].join('\n'),
+    started + '\n{malformed\n',
+  ]) {
+    const f = fixture([{ id: 'first', request: { options: { model: 'alpha/one', scopedModels: ['beta/two'] } } }]);
+    let calls = 0;
+    const worker = await running(f, createRunners({ availableModels: ['alpha/one', 'beta/two'], invoke: async () => { calls++; return { code: 0, output }; } }), { concurrency: 1 });
+    try {
+      await until(() => f.items.get('first').status === 'uncertain');
+      f.items.set('dependent', { id: 'dependent', status: 'queued', ownerId: 'owner', condition: '||', predecessorId: 'first', request: { runner: 'agent', prompt: 'dependent', lifetime: 'independent' } });
+      f.items.set('unrelated', { id: 'unrelated', status: 'queued', ownerId: 'owner', request: { runner: 'agent', prompt: 'unrelated', lifetime: 'independent' } });
+      await until(() => f.items.get('dependent').status === 'skipped');
+      assert.equal(f.items.get('unrelated').status, 'queued');
+      assert.equal(calls, 1);
+    } finally { await worker.stop(); }
+  }
+});
+
+test('clear pre-tool provider error remains failed and permits failure successor', async () => {
+  const output = [JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'provider failed' } }), JSON.stringify({ type: 'agent_settled' })].join('\n');
+  const f = fixture([{ id: 'first', request: { options: { model: 'alpha/one' } } }]);
+  let calls = 0;
+  const worker = await running(f, createRunners({ availableModels: ['alpha/one'], invoke: async () => { calls++; return { code: 0, output }; } }), { concurrency: 1 });
+  try {
+    await until(() => f.items.get('first').status === 'failed');
+    f.items.set('dependent', { id: 'dependent', status: 'queued', ownerId: 'owner', condition: '||', predecessorId: 'first', request: { runner: 'agent', prompt: 'dependent', options: { model: 'alpha/one' }, lifetime: 'independent' } });
+    await until(() => f.items.get('dependent').status === 'failed');
+    assert.equal(calls, 2);
   } finally { await worker.stop(); }
 });
 

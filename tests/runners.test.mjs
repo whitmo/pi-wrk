@@ -206,6 +206,25 @@ test('incremental JSON parser retains completion beyond 1MiB bounded output log'
   assert.equal(result.summary.length, 1100000);
 });
 
+test('post-tool failures and ambiguous completions are marked uncertain without fallback', async () => {
+  const started = { type: 'tool_execution_start', toolCallId: 'call-1', toolName: 'bash' };
+  for (const result of [
+    events('error', 'provider unavailable', [started]),
+    { code: 0, output: JSON.stringify(started) + '\n{broken\n' + events('error', 'provider unavailable').output },
+    { code: 0, output: JSON.stringify(started) + '\n' + JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'error' } }) },
+    { ...events('error', 'provider unavailable', [started]), code: 1 },
+  ]) {
+    let calls = 0;
+    const runner = createRunners({ availableModels, invoke: async () => { calls++; return result; } });
+    await assert.rejects(runner.agent(job('agent', 'work', scoped), ctx()), error => error.uncertain === true);
+    assert.equal(calls, 1);
+  }
+  let calls = 0;
+  const runner = createRunners({ availableModels, invoke: async () => { calls++; return events('error', 'provider unavailable'); } });
+  await assert.rejects(runner.agent(job('agent', 'work', { model: 'alpha/one' }), ctx()), error => error.uncertain !== true);
+  assert.equal(calls, 1);
+});
+
 test('unrecorded default runs before scoped candidates and abort during invocation never retries', async () => {
   const attempted = [];
   const runner = createRunners({ availableModels, invoke: async (_command, args) => {

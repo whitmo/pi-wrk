@@ -66,7 +66,7 @@ function processRun(command, args, { cwd, signal, emit = () => {}, env }) {
       output = (output + text).slice(-CAP);
       emit(text);
     });
-    child.once('error', error => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); reject(error); });
+    child.once('error', error => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); error.uncertain = stream.toolStarted; reject(error); });
     child.once('close', (code, sig) => {
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
@@ -93,11 +93,20 @@ function completed(result) {
     }
     return state;
   })();
-  if (result.code !== 0) throw new Error(`process exited ${result.code ?? result.signal}: ${result.output.slice(-2000)}`);
-  if (stream.malformed || !stream.settled || !stream.assistant) throw new Error('Pi did not report an unambiguous agent_settled assistant result');
+  if (result.code !== 0) {
+    const error = new Error(`process exited ${result.code ?? result.signal}: ${result.output.slice(-2000)}`);
+    error.uncertain = stream.toolStarted;
+    throw error;
+  }
+  if (stream.malformed || !stream.settled || !stream.assistant) {
+    const error = new Error('Pi did not report an unambiguous agent_settled assistant result');
+    error.uncertain = stream.toolStarted;
+    throw error;
+  }
   if (stream.assistant.stopReason !== 'stop') {
     const error = new Error(stream.assistant.errorMessage || `Pi stopped: ${stream.assistant.stopReason}`);
     error.retryable = stream.assistant.stopReason === 'error' && !stream.toolStarted;
+    error.uncertain = stream.toolStarted;
     throw error;
   }
   return stream.assistant.content?.filter(block => block.type === 'text').map(block => block.text).join('\n') || '';
