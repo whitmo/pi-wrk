@@ -290,3 +290,33 @@ test('handoff stays blocked on uncertain settlement and never reuses stale sessi
   await h.event('session_start', { reason: 'new' });
   assert.equal(h.ui.length > prior, true);
 });
+
+
+test('rapid conditional admissions bind only preceding root from same session', async t => {
+  const { parseRequest } = await import('../src/request.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'wrk-edges-ui-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = store.storePath(root);
+  const h = harness({ realStore: dir, parser: parseRequest });
+  await h.event('session_start');
+  await h.command('bg', 'first');
+  await h.command('&&', 'second');
+  await h.command('||', 'third');
+  await h.command('~&&', 'fourth');
+  await h.command('~||', 'fifth');
+  const jobs = store.listJobs(dir);
+  const find = prompt => jobs.find(job => job.request.prompt === prompt);
+  assert.equal(find('second').predecessorId, find('first').id);
+  assert.equal(find('third').predecessorId, find('second').id);
+  assert.equal(find('fourth').predecessorId, find('third').id);
+  assert.equal(find('fifth').predecessorId, find('fourth').id);
+  h.session('session-2');
+  await h.event('session_start');
+  await h.command('&&', 'orphan');
+  assert.equal(store.listJobs(dir).length, 5);
+  assert.match(h.ui.at(-1).message, /predecessor/i);
+  await h.command('bg', 'other');
+  await h.command('||', 'other followup');
+  assert.equal(store.listJobs(dir).find(j => j.request.prompt === 'other followup').predecessorId,
+    store.listJobs(dir).find(j => j.request.prompt === 'other').id);
+});

@@ -60,3 +60,12 @@ test('reject invalid lifetime and do not parse flags or selectors in prompt', ()
   assert.deepEqual(parseRequest('start --lifetime independent q:{name: review}'),
     expected('router', 'start --lifetime independent q:{name: review}'));
 });
+
+
+test('conditional aliases preserve opaque task text and reject empty or ambiguous requests', () => {
+  for (const condition of ['&&', '||', '~&&', '~||']) {
+    assert.deepEqual(parseRequest('bg  check', { alias: condition }), { ...expected('agent', ' check'), condition });
+    assert.throws(() => parseRequest(' ', { alias: condition }), /empty|task/i);
+  }
+  assert.deepEqual(parseRequest('check && later'), expected('router', 'check && later'));
+});

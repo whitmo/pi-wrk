@@ -9,8 +9,15 @@ import { createRunners } from './runners.mjs';
 import { createSwarmWorkspaces } from './workspaces.mjs';
 import YAML from 'yaml';
 
-const terminal = new Set(['succeeded', 'failed', 'cancelled', 'interrupted']);
+const terminal = new Set(['succeeded', 'failed', 'cancelled', 'interrupted', 'skipped']);
 const lockName = 'worker.lock';
+function conditionMatches(job, predecessor) {
+  if (job.condition === '&&') return predecessor.status === 'succeeded';
+  if (job.condition === '||') return predecessor.status === 'failed';
+  if (job.condition === '~&&') return predecessor.status === 'succeeded' && predecessor.verdict === 'success';
+  if (job.condition === '~||') return ['succeeded', 'failed'].includes(predecessor.status) && predecessor.verdict === 'failure';
+  return false;
+}
 // Unix socket paths are short (104 bytes on macOS), regardless of checkout depth.
 function socketPath(storeDir) {
   const uid = process.getuid();
@@ -198,6 +205,12 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
         if (job.status === 'queued' && (expired || requested)) cancel(job);
         if (active.has(job.id) && (expired || requested)) active.get(job.id).abort();
       }
+      // Decide edges before the uncertain-work safety barrier; an uncertain predecessor cannot satisfy either edge.
+      for (const job of store.listJobs(storeDir).filter(j => j.status === 'queued' && j.predecessorId)) {
+        const predecessor = store.getJob(storeDir, job.predecessorId);
+        if (!terminal.has(predecessor.status) && predecessor.status !== 'uncertain') continue;
+        if (!conditionMatches(job, predecessor)) notice(update(job.id, { status: 'skipped', error: `Condition ${job.condition} not satisfied by predecessor ${predecessor.id} (${predecessor.status}${predecessor.verdict ? `, verdict ${predecessor.verdict}` : ', no semantic verdict'})`, finishedAt: new Date().toISOString() }));
+      }
       // Unknown mutations may still be active. Do not launch even unrelated work until resolved.
       if (store.listJobs(storeDir).some(j => j.status === 'uncertain')) { await delay(pollMs); continue; }
       const queued = store.listJobs(storeDir).filter(j => j.status === 'queued' && (!j.handoff || j.handoff.ready === true));
@@ -206,6 +219,11 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
         if (occupiedSlots() >= concurrency) continue;
         if (job.request.queue && busyQueues.has(job.request.queue)) continue;
         if (job.parentId && !active.has(job.parentId)) { cancel(job); continue; }
+        if (job.predecessorId) {
+          const predecessor = store.getJob(storeDir, job.predecessorId);
+          if (!terminal.has(predecessor.status)) continue;
+          if (!conditionMatches(job, predecessor)) continue;
+        }
         launch(job);
         if (job.request.queue) busyQueues.add(job.request.queue);
       }

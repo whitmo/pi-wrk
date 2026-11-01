@@ -154,3 +154,24 @@ test('symlinked store entries cannot redirect reads or writes outside the store'
   assert.throws(() => appendJobOutput(dir, a.id, 'bad'), /symlink|invalid/i);
   assert.equal(readFileSync(elsewhere, 'utf8'), 'unchanged');
 });
+
+
+test('conditional predecessor is validated, same-owner root and immutable; verdict is durable', t => {
+  const { dir, input } = fixture(t);
+  const first = admitJob(dir, input);
+  const next = admitJob(dir, { ...input, condition: '&&', predecessorId: first.id });
+  assert.equal(getJob(dir, next.id).predecessorId, first.id);
+  assert.equal(getJob(dir, next.id).condition, '&&');
+  updateJob(dir, first.id, { verdict: 'failure' });
+  assert.equal(getJob(dir, first.id).verdict, 'failure');
+  for (const patch of [{ condition: '||' }, { predecessorId: first.id }])
+    assert.throws(() => updateJob(dir, next.id, patch), /immutable/i);
+  const other = admitJob(dir, { ...input, ownerId: 'other' });
+  const child = admitJob(dir, { ...input, parentId: first.id });
+  for (const predecessorId of [other.id, child.id, '../bad'])
+    assert.throws(() => admitJob(dir, { ...input, condition: '||', predecessorId }), /predecessor|owner|root|id/i);
+  assert.throws(() => admitJob(dir, { ...input, condition: '&&' }), /predecessor/i);
+  assert.throws(() => admitJob(dir, { ...input, predecessorId: first.id }), /condition/i);
+  assert.throws(() => admitJob(dir, { ...input, parentId: first.id, condition: '&&', predecessorId: first.id }), /root|child/i);
+  assert.throws(() => updateJob(dir, first.id, { verdict: 'perhaps' }), /verdict/i);
+});

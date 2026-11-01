@@ -12,6 +12,7 @@ type Request = {
   lifetime: 'session' | 'independent';
   handoff: boolean;
   focusMode?: 'context' | 'active' | 'none';
+  condition?: '&&' | '||' | '~&&' | '~||';
 };
 type Snapshot = { entryId: string; prompt: string; sessionId: string };
 type Job = {
@@ -21,6 +22,9 @@ type Job = {
   ownerId: string;
   handoff?: { ready: boolean; snapshot: Snapshot; reason?: string };
   error?: string;
+  predecessorId?: string;
+  condition?: Request['condition'];
+  verdict?: 'success' | 'failure';
 };
 type Session = {
   getSessionId(): string;
@@ -37,7 +41,7 @@ type Pi = Pick<ExtensionAPI, 'registerCommand' | 'on'>;
 type Dependencies = {
   parseRequest(text: string, options: { alias: string }): Request;
   storePath(root: string): string;
-  admitJob(dir: string, input: { request: Request; ownerId: string; projectRoot: string; cwd: string; handoff?: Job['handoff']; focus?: unknown }): Job;
+  admitJob(dir: string, input: { request: Request; ownerId: string; projectRoot: string; cwd: string; handoff?: Job['handoff']; focus?: unknown; predecessorId?: string; condition?: Request['condition'] }): Job;
   listJobs(dir: string): Job[];
   listQueues?(dir: string): Array<{ name: string }>;
   getJob(dir: string, id: string): Job;
@@ -74,7 +78,7 @@ function userText(content: unknown): string | undefined {
 
 /** Bind only Pi command/event handlers. External dependencies remain injectable for host-free tests. */
 export function createExtension(pi: Pi, deps: Dependencies): void {
-  let active: { sessionId: string; ownerId: string; dir: string; timer: ReturnType<typeof setInterval> } | undefined;
+  let active: { sessionId: string; ownerId: string; dir: string; timer: ReturnType<typeof setInterval>; lastRootId?: string } | undefined;
   let turn: { sessionId: string; prompt: string; toolSeen: boolean; outcome?: string } | undefined;
   let pending: { jobId: string; snapshot: Snapshot; dir: string; ownerId: string; ctx: Context; outcome?: string; toolSeen: boolean } | undefined;
   const startupErrors = new Map<string, string>();
@@ -127,11 +131,14 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       const focus = request.runner === 'shell' ? undefined : captureFocus(
         ctx.sessionManager.getBranch(), root, ctx.cwd, request.focusMode, process.env.PI_WRK_FOCUS_EXTENSION,
       );
+      if (request.condition && !session.lastRootId) throw new Error('No predecessor root job in this session');
       const job = deps.admitJob(dir, {
         request, ownerId: session.ownerId,
+        ...(request.condition ? { condition: request.condition, predecessorId: session.lastRootId } : {}),
         projectRoot: root, cwd: resolve(ctx.cwd), ...(handoff ? { handoff } : {}),
         ...(focus ? { focus } : {}),
       });
+      session.lastRootId = job.id;
       if (handoff) {
         pending = { jobId: job.id, dir, ownerId: session.ownerId, ctx, snapshot: handoff.snapshot, toolSeen: false };
         ctx.abort();
@@ -158,7 +165,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       if (!args.trim() || verb === 'jobs') {
         if (id) throw new Error('Usage: /wrk jobs');
         const jobs = deps.listJobs(dir);
-        notify(ctx, jobs.length ? jobs.map((job) => `${job.id} ${job.status}${job.handoff && !job.handoff.ready ? ` (handoff blocked: ${job.handoff.reason})` : ''}`).join('\n') : 'No jobs');
+        notify(ctx, jobs.length ? jobs.map((job) => `${job.id} ${job.status}${job.condition ? ` (${job.condition} after ${job.predecessorId})` : ''}${job.handoff && !job.handoff.ready ? ` (handoff blocked: ${job.handoff.reason})` : ''}`).join('\n') : 'No jobs');
         return;
       }
       if (['status', 'output', 'cancel'].includes(verb)) {
@@ -171,7 +178,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
           notify(ctx, deps.readJobOutput(dir, id) || `No output for ${id}`);
         } else {
           const notices = deps.readNotices(dir, job.ownerId).filter((notice) => notice.jobId === id).map((notice) => notice.message);
-          notify(ctx, `${id} ${job.status}${job.handoff && !job.handoff.ready ? `; handoff blocked: ${job.handoff.reason}` : ''}${job.error ? `; ${job.error}` : ''}${startupErrors.get(dir) ? `; ${startupErrors.get(dir)}` : ''}${notices.length ? `; ${notices.join('; ')}` : ''}`);
+          notify(ctx, `${id} ${job.status}${job.condition ? `; ${job.condition} after ${job.predecessorId}` : ''}${job.verdict ? `; verdict ${job.verdict}` : ''}${job.handoff && !job.handoff.ready ? `; handoff blocked: ${job.handoff.reason}` : ''}${job.error ? `; ${job.error}` : ''}${startupErrors.get(dir) ? `; ${startupErrors.get(dir)}` : ''}${notices.length ? `; ${notices.join('; ')}` : ''}`);
         }
         return;
       }
@@ -181,6 +188,8 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
 
   pi.registerCommand('&', { description: 'Submit work asynchronously', handler: async (args, ctx) => submit('&', args, ctx) });
   pi.registerCommand('bg', { description: 'Submit to a background agent', handler: async (args, ctx) => submit('bg', args, ctx) });
+  for (const condition of ['&&', '||', '~&&', '~||'])
+    pi.registerCommand(condition, { description: `Submit conditional background job (${condition})`, handler: async (args, ctx) => submit(condition, args, ctx) });
   pi.registerCommand('wrk', { description: 'Submit or inspect background jobs', handler: async (args, ctx) => manage(args, ctx) });
 
   pi.on('session_start', (_event, ctx) => {

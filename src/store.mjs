@@ -10,7 +10,7 @@ import { normalizeFocus } from './focus.mjs';
 
 const UUID = /^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i;
 const OWNER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const IMMUTABLE = new Set(['id', 'request', 'ownerId', 'projectRoot', 'cwd', 'createdAt', 'parentId', 'lifetime', 'queue', 'focus']);
+const IMMUTABLE = new Set(['id', 'request', 'ownerId', 'projectRoot', 'cwd', 'createdAt', 'parentId', 'lifetime', 'queue', 'focus', 'predecessorId', 'condition']);
 const OUTPUT_LIMIT = 1_048_576;
 const QUEUE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
@@ -37,12 +37,12 @@ function ownerId(id) {
   if (typeof id !== 'string' || !OWNER.test(id)) throw new Error('invalid owner id');
   return id;
 }
-function directory(path) {
+function directory(path, privateDirectory = true) {
   try { mkdirSync(path, { mode: 0o700 }); }
   catch (error) { if (error.code !== 'EEXIST') throw error; }
   const info = lstatSync(path);
   if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`invalid store directory: ${path}`);
-  chmodSync(path, 0o700);
+  if (privateDirectory) chmodSync(path, 0o700);
   return path;
 }
 function base(storeDir) {
@@ -51,7 +51,7 @@ function base(storeDir) {
 }
 function folder(storeDir, name) {
   const root = base(storeDir);
-  directory(dirname(root));
+  directory(dirname(root), false);
   directory(root);
   return directory(join(root, name));
 }
@@ -124,8 +124,16 @@ function existingJob(storeDir, id) {
       !isAbsolute(job.projectRoot ?? '') || !isAbsolute(job.cwd ?? '') ||
       typeof job.status !== 'string' || typeof job.createdAt !== 'string' ||
       typeof job.updatedAt !== 'string' || !job.request || typeof job.request !== 'object' ||
-      (job.parentId != null && !UUID.test(job.parentId)))
+      (job.parentId != null && !UUID.test(job.parentId)) ||
+      (job.predecessorId != null && !UUID.test(job.predecessorId)) ||
+      (job.condition != null && !['&&', '||', '~&&', '~||'].includes(job.condition)) ||
+      (job.verdict != null && !['success', 'failure'].includes(job.verdict)))
     throw new Error(`corrupt job: ${id}`);
+  const verdict = yamlRead(location(storeDir, 'verdicts', `${id}.yaml`));
+  if (verdict !== null) {
+    if (verdict.id !== id || !['success', 'failure'].includes(verdict.verdict)) throw new Error(`corrupt verdict: ${id}`);
+    job.verdict = verdict.verdict;
+  }
   return job;
 }
 function utf8Tail(bytes) {
@@ -141,9 +149,16 @@ export function storePath(projectRoot) {
   return join(resolve(projectRoot), '.agents', 'wrk');
 }
 
-export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, handoff, parentId, focus } = {}) {
+export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, handoff, parentId, focus, predecessorId, condition } = {}) {
   ownerId(owner);
   const parent = parentId !== undefined ? existingJob(storeDir, jobId(parentId)) : undefined;
+  if (condition !== undefined || predecessorId !== undefined) {
+    if (parent || !['&&', '||', '~&&', '~||'].includes(condition) || predecessorId === undefined)
+      throw new Error('conditional root requires a condition and predecessor');
+    const predecessor = existingJob(storeDir, jobId(predecessorId));
+    if (predecessor.ownerId !== owner || predecessor.parentId)
+      throw new Error('predecessor must be a root job of the same owner');
+  }
   focus = normalizeFocus(parent ? parent.focus : focus);
   if (!isAbsolute(projectRoot ?? '') || !isAbsolute(cwd ?? '')) throw new Error('project root and cwd must be absolute');
   safeData(request);
@@ -161,7 +176,7 @@ export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, 
     }
   }
   const jobs = folder(storeDir, 'jobs');
-  for (const name of ['cancels', 'owners', 'output', 'notices']) folder(storeDir, name);
+  for (const name of ['cancels', 'owners', 'output', 'notices', 'verdicts']) folder(storeDir, name);
   const now = new Date().toISOString();
   for (let attempt = 0; attempt < 5; attempt++) {
     const id = randomUUID();
@@ -170,6 +185,7 @@ export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, 
     if (focus !== undefined) job.focus = focus;
     if (handoff !== undefined) job.handoff = handoff;
     if (parentId !== undefined) job.parentId = parentId;
+    if (condition !== undefined) { job.condition = condition; job.predecessorId = predecessorId; }
     try { atomic(join(jobs, `${id}.yaml`), job, { exclusive: true }); return job; }
     catch (error) { if (error.code !== 'EEXIST') throw error; }
   }
@@ -187,16 +203,53 @@ export function listJobs(storeDir) {
     }).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
 }
 
+const sleep = new Int32Array(new SharedArrayBuffer(4));
+function lockedJob(storeDir, id, action) {
+  const lock = location(storeDir, 'jobs', `${id}.lock`);
+  let fd;
+  for (let tries = 0; tries < 2000; tries++) {
+    try { fd = openSync(lock, 'wx', 0o600); break; }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      try { if (Date.now() - lstatSync(lock).mtimeMs > 10000) unlinkSync(lock); }
+      catch (problem) { if (problem.code !== 'ENOENT') throw problem; }
+      Atomics.wait(sleep, 0, 0, 5);
+    }
+  }
+  if (fd === undefined) throw new Error(`job ${id} is locked; retry later`);
+  try { return action(); }
+  finally { closeSync(fd); unlinkSync(lock); }
+}
+
+function recordVerdictUnlocked(storeDir, id, verdict) {
+  jobId(id);
+  if (!['success', 'failure'].includes(verdict)) throw new Error('invalid verdict');
+  const job = existingJob(storeDir, id);
+  if (!['queued', 'running', 'routing'].includes(job.status)) throw new Error('cannot record verdict after terminal status');
+  const path = location(storeDir, 'verdicts', `${id}.yaml`);
+  try { atomic(path, { id, verdict }, { exclusive: true }); }
+  catch (error) { if (error.code !== 'EEXIST') throw error; throw new Error('verdict already recorded'); }
+  return verdict;
+}
+export function recordVerdict(storeDir, id, verdict) {
+  return lockedJob(storeDir, jobId(id), () => recordVerdictUnlocked(storeDir, id, verdict));
+}
+
 export function updateJob(storeDir, id, patch) {
   jobId(id);
   safeData(patch);
   if (!patch || typeof patch !== 'object' || Array.isArray(patch) ||
       Object.keys(patch).some(key => IMMUTABLE.has(key))) throw new Error('immutable job field or invalid patch');
-  const old = existingJob(storeDir, id);
-  const next = { ...old, ...patch, updatedAt: new Date().toISOString() };
-  safeData(next);
-  atomic(location(storeDir, 'jobs', `${id}.yaml`), next);
-  return next;
+  return lockedJob(storeDir, id, () => {
+    const old = existingJob(storeDir, id);
+    if (patch.verdict !== undefined) recordVerdictUnlocked(storeDir, id, patch.verdict);
+    const { verdict: _verdict, ...storedPatch } = patch;
+    const { verdict: _oldVerdict, ...storedOld } = old;
+    const next = { ...storedOld, ...storedPatch, updatedAt: new Date().toISOString() };
+    safeData(next);
+    atomic(location(storeDir, 'jobs', `${id}.yaml`), next);
+    return existingJob(storeDir, id);
+  });
 }
 
 export function requestCancel(storeDir, id) {

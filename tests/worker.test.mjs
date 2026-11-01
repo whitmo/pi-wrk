@@ -30,7 +30,7 @@ function fixture(jobs) {
 
 async function running(f, runners, options = {}) {
   const stop = new AbortController();
-  const work = runWorker({ storeDir: '/unused', store: f.store, runners, concurrency: 2, pollMs: 5, signal: stop.signal, ...options });
+  const work = runWorker({ storeDir: '/unused', store: f?.store, runners, concurrency: 2, pollMs: 5, signal: stop.signal, ...options });
   return { stop: async () => { stop.abort(); await work; } };
 }
 
@@ -360,4 +360,112 @@ test('ensureWorker reports a startup error rather than accepting dead worker', a
   const dir = mkdtempSync(join(tmpdir(), 'wrk-start-'));
   try { await assert.rejects(ensureWorker(dir, { workerCommand: '/no/such/node', timeoutMs: 200 }), /worker|spawn|ENOENT/i); }
   finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+
+test('conditional jobs wait, skip mismatches, and survive a worker restart in real YAML', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-condition-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'wrk');
+  const request = prompt => ({ runner: 'agent', prompt, options: {}, lifetime: 'independent' });
+  const first = admitJob(dir, { ownerId: 'one', projectRoot: root, cwd: root, request: request('first') });
+  const second = admitJob(dir, { ownerId: 'one', projectRoot: root, cwd: root, request: request('second'), condition: '~&&', predecessorId: first.id });
+  const third = admitJob(dir, { ownerId: 'one', projectRoot: root, cwd: root, request: request('third'), condition: '||', predecessorId: second.id });
+  const other = admitJob(dir, { ownerId: 'two', projectRoot: root, cwd: root, request: request('other') });
+  let resolveFirst;
+  const seen = [];
+  const runners = { agent: async job => {
+    seen.push(job.request.prompt);
+    if (job.id === first.id) await new Promise(resolve => { resolveFirst = resolve; });
+    return { summary: 'ordinary text is not a semantic verdict' };
+  } };
+  const worker = await running(null, runners, { store: undefined, storeDir: dir });
+  try {
+    await until(() => getJob(dir, first.id).status === 'running' && getJob(dir, other.id).status === 'succeeded');
+    assert.equal(getJob(dir, second.id).status, 'queued');
+    resolveFirst();
+    await until(() => getJob(dir, first.id).status === 'succeeded');
+  } finally { resolveFirst?.(); await worker.stop(); }
+  const restarted = await running(null, runners, { store: undefined, storeDir: dir });
+  try {
+    await until(() => getJob(dir, second.id).status === 'skipped' && getJob(dir, third.id).status === 'skipped');
+    assert.deepEqual(seen.sort(), ['first', 'other']);
+    assert.match(getJob(dir, second.id).error, /predecessor|verdict/i);
+    assert.equal(getJob(dir, third.id).status, 'skipped');
+  } finally { await restarted.stop(); }
+});
+
+test('worker applies status and explicit semantic edges; cancellation never satisfies OR', async () => {
+  const f = fixture([
+    { id: 'ok', status: 'succeeded', verdict: 'failure' },
+    { id: 'bad', status: 'failed' },
+    { id: 'bad-with-verdict', status: 'failed', verdict: 'failure' },
+    { id: 'cancel', status: 'cancelled' },
+    ...[['and', '&&', 'ok'], ['or', '||', 'bad'], ['semantic-fail', '~||', 'ok'],
+      ['semantic-miss', '~&&', 'bad'], ['semantic-failed-run', '~||', 'bad-with-verdict'], ['cancel-or', '||', 'cancel']].map(([id, condition, predecessorId]) => ({ id, condition, predecessorId })),
+  ]);
+  const seen = [];
+  const worker = await running(f, { agent: async job => { seen.push(job.id); return {}; } });
+  try {
+    await until(() => ['and', 'or', 'semantic-fail', 'semantic-miss', 'semantic-failed-run', 'cancel-or'].every(id => ['succeeded', 'skipped'].includes(f.items.get(id).status)));
+    assert.deepEqual(seen.sort(), ['and', 'or', 'semantic-fail', 'semantic-failed-run']);
+    assert.equal(f.items.get('cancel-or').status, 'skipped');
+  } finally { await worker.stop(); }
+});
+
+test('real-store worker release retains explicit verdict across owner writes and restart', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-verdict-release-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'wrk');
+  const request = prompt => ({ runner: 'agent', prompt, lifetime: 'independent', options: {} });
+  const parent = admitJob(dir, { ownerId: 'session-a', projectRoot: root, cwd: root, request: request('parent') });
+  const child = admitJob(dir, { ownerId: 'session-a', projectRoot: root, cwd: root, request: request('child'), condition: '~&&', predecessorId: parent.id });
+  const other = admitJob(dir, { ownerId: 'session-b', projectRoot: root, cwd: root, request: request('other') });
+  let release;
+  const seen = [];
+  const runners = { agent: async job => {
+    seen.push(job.id);
+    if (job.id === parent.id) await new Promise(resolve => { release = resolve; });
+    return { summary: 'ordinary text says failure' };
+  } };
+  const worker = await running(null, runners, { store: undefined, storeDir: dir });
+  try {
+    await until(() => getJob(dir, parent.id).status === 'running' && getJob(dir, other.id).status === 'succeeded');
+    assert.equal(getJob(dir, child.id).status, 'queued');
+    const { recordVerdict, updateJob } = await import('../src/store.mjs');
+    recordVerdict(dir, parent.id, 'success');
+    updateJob(dir, parent.id, { summary: 'owner acknowledged' });
+    assert.equal(getJob(dir, parent.id).verdict, 'success');
+    const script = `import { updateJob } from ${JSON.stringify(new URL('../src/store.mjs', import.meta.url).href)};
+      for (let i = 0; i < 40; i++) {
+        updateJob(process.argv[1], process.argv[2], { summary: 'owner ' + i });
+        if (i === 0) process.stdout.write('ready\\n');
+        await new Promise(resolve => setTimeout(resolve, 1));
+      }`;
+    const writer = spawn(process.execPath, ['--input-type=module', '-e', script, dir, parent.id], { stdio: ['ignore', 'pipe', 'inherit'] });
+    await once(writer.stdout, 'data');
+    release();
+    const [code] = await once(writer, 'close');
+    assert.equal(code, 0);
+    await until(() => getJob(dir, parent.id).status === 'succeeded');
+  } finally { release?.(); await worker.stop(); }
+  const restarted = await running(null, runners, { store: undefined, storeDir: dir });
+  try {
+    await until(() => getJob(dir, child.id).status === 'succeeded');
+    assert.equal(getJob(dir, parent.id).verdict, 'success');
+    assert.equal(seen.filter(id => id === child.id).length, 1);
+  } finally { await restarted.stop(); }
+});
+
+test('uncertain predecessor visibly skips conditional successor without starting unrelated work', async () => {
+  const f = fixture([{ id: 'unknown', status: 'running', verdict: 'failure' },
+    { id: 'dependent', condition: '~||', predecessorId: 'unknown' }, { id: 'unrelated' }]);
+  let launches = 0;
+  const worker = await running(f, { agent: async () => { launches++; return {}; } });
+  try {
+    await until(() => f.items.get('unknown').status === 'uncertain' && f.items.get('dependent').status === 'skipped');
+    assert.match(f.items.get('dependent').error, /uncertain/);
+    assert.equal(f.items.get('unrelated').status, 'queued');
+    assert.equal(launches, 0);
+  } finally { await worker.stop(); }
 });
