@@ -213,6 +213,8 @@ test('post-tool failures and ambiguous completions are marked uncertain without 
     { code: 0, output: JSON.stringify(started) + '\n{broken\n' + events('error', 'provider unavailable').output },
     { code: 0, output: JSON.stringify(started) + '\n' + JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'error' } }) },
     { ...events('error', 'provider unavailable', [started]), code: 1 },
+    { code: 0, output: '{broken\n' + events('error', 'provider unavailable').output },
+    { ...events('error', 'provider unavailable'), code: 1 },
   ]) {
     let calls = 0;
     const runner = createRunners({ availableModels, invoke: async () => { calls++; return result; } });

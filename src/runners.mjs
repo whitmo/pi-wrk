@@ -95,12 +95,12 @@ function completed(result) {
   })();
   if (result.code !== 0) {
     const error = new Error(`process exited ${result.code ?? result.signal}: ${result.output.slice(-2000)}`);
-    error.uncertain = stream.toolStarted;
+    error.uncertain = true;
     throw error;
   }
   if (stream.malformed || !stream.settled || !stream.assistant) {
     const error = new Error('Pi did not report an unambiguous agent_settled assistant result');
-    error.uncertain = stream.toolStarted;
+    error.uncertain = true;
     throw error;
   }
   if (stream.assistant.stopReason !== 'stop') {
