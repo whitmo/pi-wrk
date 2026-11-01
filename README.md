@@ -1,7 +1,7 @@
 # pi-wrk
 
-Immediate background jobs for Pi. A slash command durably admits a job in
-`<project>/.agents/wrk/` and returns without waiting for a model or worker.
+Background jobs for Pi. A slash command checks worker compatibility, then
+durably admits a job in `<project>/.agents/wrk/` without waiting for a model.
 A detached local worker owns execution; status, notices and bounded output
 remain inspectable after a foreground turn ends. Runtime data is private and
 Git-ignored. Node >=22 on macOS or Linux is required.
@@ -31,15 +31,24 @@ settings or reload a running session.
   stays unchanged. Conflicts and all worktrees are retained for inspection.
 - `/& todo`: blocked until a real shared todo-provider adapter is wired.
   No task-provider bridge has been confirmed.
-- `/wrk` or `/wrk jobs`: list jobs. `/wrk queues` lists persistent queue
-  definitions. `/wrk status <id>` includes durable notices and startup
-  failures; `/wrk output <id>` reads bounded output; `/wrk cancel <id>`
-  requests cancellation. Cancellation is not proof of termination.
+- `/wrk` or `/wrk jobs`: list jobs and their names. `/wrk queues` lists
+  persistent queue definitions. `/wrk status <id-or-name>` includes durable
+  notices; `/wrk output <id-or-name>` reads bounded output;
+  `/wrk cancel <id-or-name>` requests cancellation. Names resolve only for
+  active jobs; UUIDs also work for completed jobs. Cancellation is not
+  proof of termination.
 
 Worker-owned agents have a `wrk_message` tool for questions, blockers and
 results. The submitting session displays durable notices on its heartbeat,
 without injecting a foreground prompt or model turn. Notices remain on disk
 if the owner is absent. This is one-way delivery, not a reply channel.
+
+New jobs get unique `verb.noun.digit` names from
+`docs/sorted_short_words.csv`; unnamed worker agents inherit their job's
+name. Explicit agent definitions such as `a:{name: ari}` are unaffected.
+After reloading a new pi-wrk release, an older live worker is not reused or
+stopped automatically: wait for its jobs to drain, stop the old worker, then
+retry submission. This avoids interrupting active work.
 
 The default `session` lifetime ends with the submitting session's lease,
 including queued work. Prefix a request with `--lifetime independent` to
