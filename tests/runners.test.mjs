@@ -94,8 +94,9 @@ test('router selects only a valid pattern, not unvalidated prose', async () => {
 test('council uses separate read-only child assessments and synthesis', async () => {
   const prompts = [];
   const children = [];
+  let calls = 0;
   const context = { ...ctx(), submitChild: request => { prompts.push(request.prompt); const child = { id: `child-${prompts.length}` }; children.push(child); return child; }, getChild: async id => ({ status: 'succeeded', summary: `result from ${id}` }) };
-  const invoke = async (_command, args) => ({ code: 0, output: JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: args.at(-1).includes('Synthesize') ? 'combined' : '["part one", "part two"]' }] } }) + '\n' + JSON.stringify({ type: 'agent_settled' }) + '\n' });
+  const invoke = async (_command, args) => { calls++; return { code: 0, output: JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: args.at(-1).includes('Synthesize') ? 'combined' : '["part one", "part two"]' }] } }) + '\n' + JSON.stringify({ type: 'agent_settled' }) + '\n' }; };
   const runners = createRunners({ invoke: async (command, args, config) => {
     assert.match(args[args.indexOf('--append-system-prompt') + 1], /Ship small changes/);
     return invoke(command, args, config);
@@ -103,6 +104,7 @@ test('council uses separate read-only child assessments and synthesis', async ()
   const focusedJob = { ...job('council'), focus: captureFocus([entry()], '/source', '/source') };
   assert.equal((await runners.council(focusedJob, context)).summary, 'combined');
   assert.equal(prompts.length, 2);
+  assert.equal(calls, 2); // one planning call, one synthesis call
 });
 
 test('swarm preserves exact assignments in isolated Git worktrees and integrates own commits', async t => {
@@ -116,6 +118,7 @@ test('swarm preserves exact assignments in isolated Git worktrees and integrates
   git(root, 'config', 'user.email', 'test@example.invalid'); git(root, 'config', 'user.name', 'Test');
   writeFileSync(join(root, '.gitignore'), '.agents/\n'); git(root, 'add', '.gitignore'); git(root, 'commit', '-qm', 'base');
   const prompts = [];
+  let calls = 0;
   const context = { ...ctx(), createWorkspaces: () => createSwarmWorkspaces({ projectRoot: root, cwd: root }),
     submitChild(request, workspace) {
       prompts.push(request.prompt);
@@ -124,12 +127,13 @@ test('swarm preserves exact assignments in isolated Git worktrees and integrates
       git(workspace.projectRoot, 'add', '.'); git(workspace.projectRoot, 'commit', '-qm', 'child');
       return { id: `child-${prompts.length}` };
     }, getChild: async id => ({ status: 'succeeded', summary: `finished ${id}` }) };
-  const invoke = async (_command, args) => ({ code: 0, output: [
+  const invoke = async (_command, args) => { calls++; return { code: 0, output: [
     JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: args.at(-1).includes('Synthesize') ? 'reviewed' : '["part one", "part two"]' }] } }),
     JSON.stringify({ type: 'agent_settled' }),
-  ].join('\n') });
+  ].join('\n') }; };
   const result = await createRunners({ invoke }).swarm({ ...job('swarm', 'build these'), projectRoot: root, cwd: root }, context);
   assert.deepEqual(prompts, ['part one', 'part two']);
+  assert.equal(calls, 2); // one planning call, one synthesis call
   assert.match(result.summary, /integration branch/);
   assert.match(result.summary, /commits: 2/);
   assert.equal(readFileSync(join(root, '.gitignore'), 'utf8'), '.agents/\n');
@@ -137,4 +141,106 @@ test('swarm preserves exact assignments in isolated Git worktrees and integrates
 
 test('todo fails explicitly without shared task adapter', async () => {
   await assert.rejects(createRunners().todo(job('todo'), ctx()), /todo provider unavailable/i);
+});
+
+const completion = text => ({ code: 0, output: [
+  JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text }] } }),
+  JSON.stringify({ type: 'agent_settled' }),
+].join('\n') });
+
+test('council and swarm correct recorded object-shaped assignments before child effects', async () => {
+  const recorded = JSON.stringify([
+    { reviewers: ['thermo (luna 6)', 'codex (sol 6.1)'], assignment: 'review PR for security' },
+    { reviewers: ['pocock', 'ponytail'], assignment: 'review PR for style' },
+  ]);
+  for (const kind of ['council', 'swarm']) {
+    const calls = [];
+    const task = 'Review PR with all named reviewers verbatim';
+    const context = { ...ctx(),
+      createWorkspaces: () => { calls.push('workspace'); return { integration: { branch: 'integration', projectRoot: '/integration' }, children: [{ projectRoot: '/one', branch: 'one' }, { projectRoot: '/two', branch: 'two' }] }; },
+      submitChild: (request) => { calls.push(request.prompt); return { id: `child-${calls.length}` }; },
+      getChild: async () => ({ status: 'failed', error: 'stop before integration' }),
+    };
+    const invoke = async (_command, args) => {
+      calls.push(args.at(-1));
+      if (calls.filter(x => x.startsWith('Task:') || x.includes('\nTask:\n')).length === 1) return completion(recorded);
+      return completion('["first bounded task", "second bounded task"]');
+    };
+    await assert.rejects(createRunners({ invoke })[kind](job(kind, task), context), /stop before integration/);
+    assert.equal(calls.filter(x => x.includes('\nTask:\n')).length, 2);
+    assert.ok(calls[0].includes(task));
+    assert.ok(calls[1].includes(task) && calls[1].includes('string'));
+    assert.ok(calls.indexOf('workspace') > 1 || kind === 'council');
+    assert.ok(calls.some(x => x === 'first bounded task' || x === `Read-only assessment (first bounded task): ${task}`));
+    assert.ok(calls.some(x => x === 'second bounded task' || x === `Read-only assessment (second bounded task): ${task}`));
+    assert.ok(!calls.some(x => x.includes('review PR for security') && !x.includes('Task:')));
+  }
+});
+
+test('invalid plans are corrected once and rejected without child effects', async () => {
+  for (const [bad, shape] of [
+    ['not JSON', /JSON/i], ['["one"]', /two|count/i], ['["one", "  "]', /blank|empty/i], ['["one", {"assignment":"two"}]', /string/i],
+  ]) {
+    for (const kind of ['council', 'swarm']) {
+      let attempts = 0;
+      let effects = 0;
+      const invoke = async () => { attempts++; return completion(bad); };
+      const context = { ...ctx(), createWorkspaces: () => { effects++; }, submitChild: () => { effects++; } };
+      await assert.rejects(createRunners({ invoke })[kind](job(kind), context), error => {
+        assert.match(error.message, shape);
+        assert.match(error.message, /2|second|correction/i);
+        assert.ok(!error.message.includes(bad));
+        return true;
+      });
+      assert.equal(attempts, 2, `${kind}: ${bad}`);
+      assert.equal(effects, 0);
+    }
+  }
+});
+
+test('planner model errors and cancellation are not retried', async () => {
+  for (const [error, expected] of [[new Error('model unavailable'), /model unavailable/], [new Error('job cancelled'), /cancelled/]]) {
+    let attempts = 0;
+    await assert.rejects(createRunners({ invoke: async () => { attempts++; throw error; } }).swarm(job('swarm'), ctx()), expected);
+    assert.equal(attempts, 1);
+  }
+  let modelCalls = 0;
+  const modelFailure = async () => { modelCalls++; return { code: 0, output: [
+    JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'model denied' } }),
+    JSON.stringify({ type: 'agent_settled' }),
+  ].join('\n') }; };
+  await assert.rejects(createRunners({ invoke: modelFailure }).council(job('council'), ctx()), /model denied/);
+  assert.equal(modelCalls, 1);
+  const controller = new AbortController();
+  let attempts = 0;
+  await assert.rejects(createRunners({ invoke: async () => { attempts++; controller.abort(); return completion('["one"]'); } }).council(job('council'), ctx(controller.signal)), /cancel/i);
+  assert.equal(attempts, 1);
+});
+
+test('group and router retain bounded nested child error and failed child identity', async () => {
+  const huge = `private failure ${'x'.repeat(9000)} tail marker`;
+  for (const kind of ['council', 'swarm']) {
+    const context = { ...ctx(),
+      createWorkspaces: () => ({ integration: { branch: 'integration', projectRoot: '/integration' }, children: [{ branch: 'a', projectRoot: '/a' }, { branch: 'b', projectRoot: '/b' }] }),
+      submitChild: (_request, _space) => ({ id: _space?.branch ?? 'council-child' }),
+      getChild: async id => ({ status: 'failed', error: huge, summary: `fallback ${id}` }),
+    };
+    await assert.rejects(createRunners({ invoke: async () => completion('["one","two"]') })[kind](job(kind), context), error => {
+      assert.match(error.message, /failed/);
+      assert.match(error.message, /private failure/);
+      assert.match(error.message, kind === 'swarm' ? /a \(failed\).*b \(failed\)/ : /council-child \(failed\)/);
+      assert.ok(error.message.length < 2000);
+      assert.ok(!error.message.includes('tail marker'));
+      if (kind === 'swarm') assert.match(error.message, /integration.*\/integration.*\/a.*\/b/);
+      return true;
+    });
+  }
+  const router = createRunners({ invoke: async () => completion('"swarm"') }).router;
+  await assert.rejects(router(job('router'), { ...ctx(), submitChild: () => ({ id: 'routed-42' }), getChild: async () => ({ status: 'failed', error: 'invalid swarm assignments (wrong count)' }) }), /routed-42.*failed.*wrong count/);
+  await assert.rejects(router(job('router'), { ...ctx(), submitChild: () => ({ id: 'routed-43' }), getChild: async () => ({ status: 'cancelled', summary: 'cancelled while assessing' }) }), /routed-43.*cancelled.*cancelled while assessing/);
+  await assert.rejects(router(job('router'), { ...ctx(), submitChild: () => ({ id: 'routed-44' }), getChild: async () => ({ status: 'failed', error: huge }) }), error => {
+    assert.ok(error.message.length < 400);
+    assert.ok(!error.message.includes('tail marker'));
+    return true;
+  });
 });
