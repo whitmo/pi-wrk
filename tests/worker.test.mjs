@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, utimesSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, utimesSync, existsSync, readFileSync } from 'node:fs';
 import { admitJob, getJob, readJobOutput, requestCancel, touchOwner } from '../src/store.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -360,13 +360,15 @@ test('notice failure cannot overwrite successful runner outcome', async () => {
 
 test('detached worker waits out a recent unverifiable lock and becomes ready', async () => {
   const temp = mkdtempSync(join(tmpdir(), 'wrk-restart-'));
-  const lock = join(temp, 'worker.lock');
+  const storeDir = join(temp, 'store');
+  mkdirSync(storeDir);
+  const lock = join(storeDir, 'worker.lock');
   writeFileSync(lock, 'pid: 999999\ntoken: old-unverified\nstartedAt: 1\n');
   const old = new Date(Date.now() - 9600);
   utimesSync(lock, old, old);
   let child;
   try {
-    await ensureWorker(temp, { timeoutMs: 4500, spawnWorker: (command, args, options) => {
+    await ensureWorker(storeDir, { timeoutMs: 4500, spawnWorker: (command, args, options) => {
       child = spawn(command, args, options);
       return child;
     } });
