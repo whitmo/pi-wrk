@@ -1,0 +1,229 @@
+Word,Size,Part of Speech
+A,1,Noun (Proper / Name)
+a,1,Article / Determiner
+Abel,4,Noun (Proper / Name)
+Ace,3,Noun (Proper / Name)
+act,3,Noun / Verb
+Ada,3,Noun (Proper / Name)
+Adam,4,Noun (Proper / Name)
+add,3,Verb
+age,3,Noun / Verb
+aim,3,Noun / Verb
+air,3,Noun / Verb
+Al,2,Noun (Proper / Name)
+Alex,4,Noun (Proper / Name)
+Ali,3,Noun (Proper / Name)
+all,3,Determiner / Adverb
+am,2,Verb
+Amy,3,Noun (Proper / Name)
+an,2,Article / Determiner
+and,3,Conjunction
+Anna,4,Noun (Proper / Name)
+any,3,Determiner / Adverb
+ape,3,Noun
+Aria,4,Noun (Proper / Name)
+Arlo,4,Noun (Proper / Name)
+art,3,Noun
+as,2,Conjunction / Adverb
+at,2,Preposition
+Ava,3,Noun (Proper / Name)
+back,4,Noun / Adverb / Verb
+bad,3,Adjective
+bag,3,Noun
+bake,4,Verb
+ball,4,Noun
+band,4,Noun / Verb
+bank,4,Noun / Verb
+bark,4,Noun / Verb
+barn,4,Noun
+base,4,Noun / Verb
+be,2,Verb
+bear,4,Noun / Verb
+Beau,4,Noun (Proper / Name)
+bell,4,Noun
+belt,4,Noun / Verb
+Ben,3,Noun (Proper / Name)
+best,4,Adjective / Adverb
+big,3,Adjective
+bike,4,Noun / Verb
+bird,4,Noun
+bit,3,Noun / Verb
+blow,4,Verb / Noun
+blue,4,Adjective / Noun
+boat,4,Noun / Verb
+Bob,3,Noun (Proper / Name)
+body,4,Noun
+bold,4,Adjective
+bone,4,Noun
+book,4,Noun / Verb
+boom,4,Noun / Verb
+boss,4,Noun / Verb
+bowl,4,Noun / Verb
+box,3,Noun / Verb
+boy,3,Noun
+burn,4,Verb / Noun
+bus,3,Noun
+bush,4,Noun
+busy,4,Adjective
+but,3,Conjunction / Preposition
+buy,3,Verb / Noun
+by,2,Preposition
+cake,4,Noun
+call,4,Verb / Noun
+calm,4,Adjective / Verb
+camp,4,Noun / Verb
+can,3,Verb / Noun
+car,3,Noun
+card,4,Noun
+care,4,Noun / Verb
+case,4,Noun
+cash,4,Noun / Verb
+cast,4,Verb / Noun
+cat,3,Noun
+cave,4,Noun / Verb
+Cole,4,Noun (Proper / Name)
+Cora,4,Noun (Proper / Name)
+cow,3,Noun
+cry,3,Verb / Noun
+cut,3,Verb / Noun
+Dan,3,Noun (Proper / Name)
+day,3,Noun
+Dean,4,Noun (Proper / Name)
+did,3,Verb
+die,3,Verb
+dig,3,Verb / Noun
+dim,3,Adjective / Verb
+do,2,Verb
+dog,3,Noun
+Drew,4,Noun (Proper / Name)
+dry,3,Adjective / Verb
+due,3,Adjective / Noun
+ear,3,Noun
+eat,3,Verb
+Ed,2,Noun (Proper / Name)
+Eden,4,Noun (Proper / Name)
+egg,3,Noun / Verb
+Eli,3,Noun (Proper / Name)
+Ella,4,Noun (Proper / Name)
+Emma,4,Noun (Proper / Name)
+end,3,Noun / Verb
+Eric,4,Noun (Proper / Name)
+Erin,4,Noun (Proper / Name)
+Eva,3,Noun (Proper / Name)
+Evan,4,Noun (Proper / Name)
+Eve,3,Noun (Proper / Name)
+eye,3,Noun / Verb
+Ezra,4,Noun (Proper / Name)
+fan,3,Noun / Verb
+far,3,Adverb / Adjective
+fat,3,Adjective / Noun
+few,3,Determiner / Adjective
+Finn,4,Noun (Proper / Name)
+fit,3,Adjective / Verb
+fix,3,Verb / Noun
+fly,3,Verb / Noun
+for,3,Preposition / Conjunction
+fox,3,Noun
+fry,3,Verb / Noun
+fun,3,Noun / Adjective
+fur,3,Noun
+gas,3,Noun / Verb
+gel,3,Noun / Verb
+get,3,Verb
+go,2,Verb
+god,3,Noun
+gum,3,Noun
+Gus,3,Noun (Proper / Name)
+guy,3,Noun
+had,3,Verb
+hat,3,Noun
+hay,3,Noun
+he,2,Pronoun
+her,3,Pronoun / Determiner
+him,3,Pronoun
+his,3,Determiner / Pronoun
+hit,3,Verb / Noun
+hop,3,Verb / Noun
+hot,3,Adjective
+how,3,Adverb / Conjunction
+hug,3,Verb / Noun
+hut,3,Noun
+I,1,Pronoun
+I,1,Noun (Proper / Name)
+Ian,3,Noun (Proper / Name)
+ice,3,Noun / Verb
+if,2,Conjunction
+ill,3,Adjective / Adverb
+in,2,Preposition
+ink,3,Noun
+inn,3,Noun
+Ira,3,Noun (Proper / Name)
+Iris,4,Noun (Proper / Name)
+is,2,Verb
+Isla,4,Noun (Proper / Name)
+it,2,Pronoun
+Ivy,3,Noun (Proper / Name)
+Jack,4,Noun (Proper / Name)
+jam,3,Noun / Verb
+Jane,4,Noun (Proper / Name)
+jar,3,Noun
+jaw,3,Noun
+Jax,3,Noun (Proper / Name)
+jay,3,Noun
+jet,3,Noun / Verb
+Jim,3,Noun (Proper / Name)
+Jo,2,Noun (Proper / Name)
+job,3,Noun
+Joe,3,Noun (Proper / Name)
+jog,3,Verb / Noun
+John,4,Noun (Proper / Name)
+Jon,3,Noun (Proper / Name)
+joy,3,Noun
+jug,3,Noun
+June,4,Noun (Proper / Name)
+Kate,4,Noun (Proper / Name)
+Leon,4,Noun (Proper / Name)
+Levi,4,Noun (Proper / Name)
+Liam,4,Noun (Proper / Name)
+Lily,4,Noun (Proper / Name)
+Luca,4,Noun (Proper / Name)
+Lucy,4,Noun (Proper / Name)
+Luke,4,Noun (Proper / Name)
+Luna,4,Noun (Proper / Name)
+Mark,4,Noun (Proper / Name)
+Mary,4,Noun (Proper / Name)
+Maya,4,Noun (Proper / Name)
+me,2,Pronoun
+Mila,4,Noun (Proper / Name)
+Milo,4,Noun (Proper / Name)
+my,2,Determiner / Pronoun
+Nick,4,Noun (Proper / Name)
+no,2,Adverb / Determiner
+Noah,4,Noun (Proper / Name)
+Nora,4,Noun (Proper / Name)
+Nova,4,Noun (Proper / Name)
+O,1,Interjection
+of,2,Preposition
+on,2,Preposition
+or,2,Conjunction
+Owen,4,Noun (Proper / Name)
+Paul,4,Noun (Proper / Name)
+Remi,4,Noun (Proper / Name)
+Rose,4,Noun (Proper / Name)
+Ruby,4,Noun (Proper / Name)
+Ryan,4,Noun (Proper / Name)
+Sage,4,Noun (Proper / Name)
+Sara,4,Noun (Proper / Name)
+Seth,4,Noun (Proper / Name)
+so,2,Adverb / Conjunction
+Theo,4,Noun (Proper / Name)
+to,2,Preposition
+up,2,Adverb / Preposition
+us,2,Pronoun
+Vera,4,Noun (Proper / Name)
+we,2,Pronoun
+Wren,4,Noun (Proper / Name)
+Zane,4,Noun (Proper / Name)
+Zara,4,Noun (Proper / Name)
+Zoe,4,Noun (Proper / Name)
+Zoey,4,Noun (Proper / Name)

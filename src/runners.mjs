@@ -3,6 +3,7 @@ import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { StringDecoder } from 'node:string_decoder';
 import YAML from 'yaml';
 import { integrateSwarm } from './workspaces.mjs';
 import { formatFocus, normalizeFocus } from './focus.mjs';
@@ -30,6 +31,24 @@ function processRun(command, args, { cwd, signal, emit = () => {}, env }) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'], detached: process.platform !== 'win32' });
     let output = '';
+    let line = '';
+    const decoder = new StringDecoder('utf8');
+    const stream = { settled: false, assistant: null, toolStarted: false, malformed: false };
+    const consume = text => {
+      line += text;
+      let end;
+      while ((end = line.indexOf('\n')) !== -1) {
+        const record = line.slice(0, end).replace(/\r$/, '');
+        line = line.slice(end + 1);
+        if (!record.trim()) continue;
+        try {
+          const event = JSON.parse(record);
+          if (event.type === 'tool_execution_start') stream.toolStarted = true;
+          if (event.type === 'message_end' && event.message?.role === 'assistant') stream.assistant = event.message;
+          if (event.type === 'agent_settled') stream.settled = true;
+        } catch { stream.malformed = true; }
+      }
+    };
     let aborting = false;
     let timer;
     const terminate = (force = false) => {
@@ -52,35 +71,61 @@ function processRun(command, args, { cwd, signal, emit = () => {}, env }) {
     };
     if (signal?.aborted) onAbort();
     else signal?.addEventListener('abort', onAbort, { once: true });
-    for (const stream of [child.stdout, child.stderr]) stream.on('data', chunk => {
+    child.stdout.on('data', chunk => {
+      consume(decoder.write(chunk));
       const text = chunk.toString();
       output = (output + text).slice(-CAP);
       emit(text);
     });
-    child.once('error', error => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); reject(error); });
+    child.stderr.on('data', chunk => {
+      const text = chunk.toString();
+      output = (output + text).slice(-CAP);
+      emit(text);
+    });
+    child.once('error', error => { clearTimeout(timer); signal?.removeEventListener('abort', onAbort); error.uncertain = stream.toolStarted; reject(error); });
     child.once('close', (code, sig) => {
       clearTimeout(timer);
       signal?.removeEventListener('abort', onAbort);
+      consume(decoder.end());
+      if (line.trim()) stream.malformed = true;
       if (aborting || signal?.aborted) { terminate(true); reject(abortError()); }
-      else resolve({ code, signal: sig, output });
+      else resolve({ code, signal: sig, output, stream });
     });
   });
 }
 
 function completed(result) {
-  if (result.code !== 0) throw new Error(`process exited ${result.code ?? result.signal}: ${result.output.slice(-2000)}`);
-  let settled = false;
-  let assistant;
-  for (const line of result.output.split('\n')) {
-    if (!line.trim()) continue;
-    let event;
-    try { event = JSON.parse(line); } catch { continue; }
-    if (event.type === 'message_end' && event.message?.role === 'assistant') assistant = event.message;
-    if (event.type === 'agent_settled') settled = true;
+  const stream = result.stream ?? (() => {
+    // Injected invokers in tests may still return a complete JSONL string.
+    const state = { settled: false, assistant: null, toolStarted: false, malformed: false };
+    for (const line of result.output.split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const event = JSON.parse(line);
+        if (event.type === 'tool_execution_start') state.toolStarted = true;
+        if (event.type === 'message_end' && event.message?.role === 'assistant') state.assistant = event.message;
+        if (event.type === 'agent_settled') state.settled = true;
+      } catch { state.malformed = true; }
+    }
+    return state;
+  })();
+  if (result.code !== 0) {
+    const error = new Error(`process exited ${result.code ?? result.signal}: ${result.output.slice(-2000)}`);
+    error.uncertain = true;
+    throw error;
   }
-  if (!settled || !assistant) throw new Error('Pi did not report an agent_settled assistant result');
-  if (assistant.stopReason !== 'stop') throw new Error(assistant.errorMessage || `Pi stopped: ${assistant.stopReason}`);
-  return assistant.content?.filter(block => block.type === 'text').map(block => block.text).join('\n') || '';
+  if (stream.malformed || !stream.settled || !stream.assistant) {
+    const error = new Error('Pi did not report an unambiguous agent_settled assistant result');
+    error.uncertain = true;
+    throw error;
+  }
+  if (stream.assistant.stopReason !== 'stop') {
+    const error = new Error(stream.assistant.errorMessage || `Pi stopped: ${stream.assistant.stopReason}`);
+    error.retryable = stream.assistant.stopReason === 'error' && !stream.toolStarted;
+    error.uncertain = stream.toolStarted;
+    throw error;
+  }
+  return stream.assistant.content?.filter(block => block.type === 'text').map(block => block.text).join('\n') || '';
 }
 
 function installedDefinitions(cwd) {
@@ -109,11 +154,12 @@ export function createRunners({ piCommand = 'pi', definitions, availableModels, 
     const options = { ...job.request.options, ...extra };
     const selected = options.name ? (definitions ?? installedDefinitions(job.cwd))[options.name] : null;
     if (options.name && !selected) throw new Error(`unknown agent: ${options.name}`);
-    const model = options.model ?? selected?.model;
-    if (model && !(availableModels ?? installedModels(piCommand)).includes(model)) throw new Error(`unknown model: ${model}`);
+    const model = options.model ?? selected?.model ?? options.defaultModel;
+    const models = model ? (availableModels ?? installedModels(piCommand)) : availableModels;
+    if (model && !models.includes(model)) throw new Error(`unknown model: ${model}`);
     const args = ['--mode', 'json', '--no-extensions', '--no-session', '--offline'];
     const focus = normalizeFocus(job.focus);
-    const env = context.storeDir ? { ...process.env, PI_WRK_STORE: context.storeDir, PI_WRK_JOB_ID: job.id } : undefined;
+    const env = context.storeDir ? { ...process.env, PI_WRK_STORE: context.storeDir, PI_WRK_JOB_ID: job.id, ...(job.name ? { PI_WRK_JOB_NAME: job.name } : {}) } : undefined;
     if (focus?.mode === 'active') {
       const { prepareFocusActivation } = await import('./focus-runtime.mjs');
       await prepareFocusActivation(focus);
@@ -129,13 +175,29 @@ export function createRunners({ piCommand = 'pi', definitions, availableModels, 
       if (env && !enabled.includes('wrk_message')) enabled.push('wrk_message');
       args.push('--tools', enabled.join(','));
     }
-    if (model) args.push('--model', model);
     if (selected?.prompt) args.push('--system-prompt', selected.prompt);
     if (options.systemInstruction) args.push('--append-system-prompt', options.systemInstruction);
     args.push('--', job.request.prompt);
-    const result = await invoke(piCommand, args, { cwd: job.cwd, signal: context.signal, emit: context.emit, env });
-    const summary = completed(result);
-    return { summary, output: summary };
+    const candidates = [model ?? null, ...(Array.isArray(options.scopedModels) ? options.scopedModels : [])]
+      .filter((candidate, index, all) => (candidate === null || typeof candidate === 'string' && candidate && (!models || models.includes(candidate))) && all.indexOf(candidate) === index)
+      .slice(0, 3);
+    const attempted = [];
+    for (const candidate of candidates) {
+      if (context.signal?.aborted) throw abortError();
+      attempted.push(candidate ?? '(default)');
+      context.emit?.(`Model attempt: ${attempted.at(-1)}\n`);
+      const runArgs = candidate ? [...args.slice(0, -2), '--model', candidate, ...args.slice(-2)] : args;
+      try {
+        const summary = completed(await invoke(piCommand, runArgs, { cwd: job.cwd, signal: context.signal, emit: context.emit, env }));
+        if (context.signal?.aborted) throw abortError();
+        return { summary, output: summary, attemptedModels: attempted };
+      } catch (error) {
+        if (!error.retryable || attempted.length === candidates.length || context.signal?.aborted) {
+          error.message += ` (attempted models: ${attempted.join(', ')})`;
+          throw error;
+        }
+      }
+    }
   }
   async function ask(job, context, instruction) {
     return (await agent({ ...job, request: { runner: 'agent', prompt: `${instruction}\n\nTask:\n${job.request.prompt}`, options: {} } }, context, { model: job.request.options?.model, tools: 'read,grep,find,ls' })).summary;

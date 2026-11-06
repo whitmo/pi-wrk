@@ -7,6 +7,17 @@ function removeSeparator(text) {
   return /^\s/.test(text) ? text.slice(1) : text;
 }
 
+function trimNextControl(text, allowFlags = false) {
+  const next = text.trimStart();
+  const selectorOrRunner = /^(?:[A-Za-z][\w-]*:\{|(?:bg|swarm|council|todo)(?=\s|$))/.test(next);
+  const flag = allowFlags && /^--(?:lifetime|focus)(?=\s|$)/.test(next);
+  return next !== text && (selectorOrRunner || flag) ? next : text;
+}
+
+function removeControlSeparator(text) {
+  return trimNextControl(removeSeparator(text), true);
+}
+
 function consumeMap(text, type) {
   const start = type.length + 1;
   if (text[start] !== '{') throw new Error(`invalid ${type} selector`);
@@ -46,8 +57,9 @@ function consumeMap(text, type) {
 
 export function parseRequest(text, { alias = '&' } = {}) {
   if (typeof text !== 'string') throw new TypeError('request text must be a string');
-  if (!['&', 'bg', 'wrk'].includes(alias)) throw new Error('invalid command alias');
-  let lifetime = 'session', runner = alias === 'bg' ? 'agent' : 'router';
+  if (!['&', 'bg', 'wrk', '&&', '||', '~&&', '~||'].includes(alias)) throw new Error('invalid command alias');
+  const condition = ['&&', '||', '~&&', '~||'].includes(alias) ? { condition: alias } : {};
+  let lifetime = 'session', runner = alias === 'bg' || condition.condition ? 'agent' : 'router';
   let options = {}, queue = null, source = text;
   const flags = {};
   while (/^--(?:lifetime|focus)(?=\s|$)/.test(source)) {
@@ -57,12 +69,12 @@ export function parseRequest(text, { alias = '&' } = {}) {
     if (flags[flag] || !(flag === 'focus' ? ['context', 'active', 'none'] : ['session', 'independent']).includes(value))
       throw new Error(`invalid or duplicate ${flag}`);
     flags[flag] = value;
-    source = removeSeparator(source.slice(match[0].length));
+    source = removeControlSeparator(source.slice(match[0].length));
   }
   lifetime = flags.lifetime ?? lifetime;
   const focus = flags.focus ? { focusMode: flags.focus } : {};
   if (!source.trim()) {
-    if (alias === 'wrk') throw new Error('empty task');
+    if (alias === 'wrk' || condition.condition) throw new Error('empty conditional task');
     return { runner: 'agent', prompt: '', options, queue, lifetime, handoff: true, ...focus };
   }
   // The prefix is the only control surface. The remainder is opaque user text.
@@ -70,6 +82,7 @@ export function parseRequest(text, { alias = '&' } = {}) {
     throw new Error('unknown selector');
   if (source.startsWith('q:')) {
     [options, source] = consumeMap(source, 'q');
+    source = trimNextControl(source);
     queue = options.name;
     options = {};
     if (/^[A-Za-z][\w-]*:\{/.test(source) && !/^(?:a|sh):\{/.test(source))
@@ -96,5 +109,5 @@ export function parseRequest(text, { alias = '&' } = {}) {
   if (!source.trim() && runner !== 'todo' && !(runner === 'shell' && options.command))
     throw new Error('empty explicit task');
   if (runner === 'shell' && flags.focus && flags.focus !== 'none') throw new Error('focus is not supported for shell jobs');
-  return { runner, prompt: source, options, queue, lifetime, handoff: false, ...focus };
+  return { runner, prompt: source, options, queue, lifetime, handoff: false, ...focus, ...condition };
 }
