@@ -92,6 +92,29 @@ test('BTW submission stays in the current session and publishes an inspectable a
   assert.match(h.ui.at(-1).message, /succeeded/);
 });
 
+test('BTW roots have names and become the next conditional predecessor', async t => {
+  const { parseRequest } = await import('../src/request.mjs');
+  const root = mkdtempSync(join(tmpdir(), 'wrk-btw-chain-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = store.storePath(root);
+  const h = harness({ realStore: dir, parser: parseRequest });
+  h.onBus('pi-wrk:btw-submit', ({ accept }) => accept());
+  await h.event('session_start');
+  await h.command('wrk', 'btw first question');
+  const first = store.listJobs(dir).find(j => j.request.runner === 'btw');
+  assert.match(first.name, /^[a-z]+\.[a-z]+\.[0-9]$/);
+  await h.command('wrk', `status ${first.name}`);
+  assert.match(h.ui.at(-1).message, /running/);
+  await h.command('&&', 'after first BTW');
+  assert.equal(store.listJobs(dir).find(j => j.request.prompt === 'after first BTW').predecessorId, first.id);
+  await h.command('bg', 'normal root');
+  await h.command('wrk', 'btw second question');
+  const second = store.listJobs(dir).find(j => j.request.prompt === 'second question');
+  assert.match(second.name, /^[a-z]+\.[a-z]+\.[0-9]$/);
+  await h.command('&&', 'after second BTW');
+  assert.equal(store.listJobs(dir).find(j => j.request.prompt === 'after second BTW').predecessorId, second.id);
+});
+
 test('BTW answer remains readable from the durable job store', async t => {
   const root = mkdtempSync(join(tmpdir(), 'wrk-btw-ui-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));

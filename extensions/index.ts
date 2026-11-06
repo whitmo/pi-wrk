@@ -91,6 +91,13 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   const words = loadNameWords(new URL('../docs/sorted_short_words.csv', import.meta.url));
   const generateWorkItemName = () => generateName(words);
   const display = (job: Job) => job.name ? `${job.name} ${job.id}` : job.id;
+  function admitNamed(dir: string, input: Parameters<Dependencies['admitJob']>[1]): Job {
+    for (let attempt = 0; attempt < 30; attempt++) {
+      try { return deps.admitJob(dir, { ...input, name: generateWorkItemName() }); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+    }
+    throw new Error('could not allocate unique work-item name after 30 attempts');
+  }
   let active: { sessionId: string; ownerId: string; dir: string; timer: ReturnType<typeof setInterval>; lastRootId?: string } | undefined;
   let turn: { sessionId: string; prompt: string; toolSeen: boolean; outcome?: string } | undefined;
   let pending: { jobId: string; snapshot: Snapshot; dir: string; ownerId: string; ctx: Context; outcome?: string; toolSeen: boolean } | undefined;
@@ -131,10 +138,11 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       if (!question.trim()) throw new Error('Usage: /wrk btw <question>');
       const dir = session.dir;
       const root = deps.projectRoot(ctx.cwd);
-      const job = deps.admitJob(dir, {
+      const job = admitNamed(dir, {
         request: { runner: 'btw', prompt: question.trim(), options: {}, queue: null, lifetime: 'session', handoff: false },
         ownerId: session.ownerId, projectRoot: root, cwd: resolve(ctx.cwd), initialStatus: 'running',
       });
+      session.lastRootId = job.id;
       const done = (result: BtwResult) => {
         if (!btwJobs.delete(job.id)) return;
         try {
@@ -166,7 +174,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
         done({ error: error instanceof Error ? error.message : String(error) });
       }
       if (!accepted) done({ error: 'pi-btw background query adapter unavailable; install the integrated pi-btw extension' });
-      notify(ctx, `${job.id} BTW ${deps.getJob(dir, job.id).status}; inspect with /wrk status ${job.id} or /wrk output ${job.id}`);
+      notify(ctx, `${display(job)} BTW ${deps.getJob(dir, job.id).status}; inspect with /wrk status ${job.id} or /wrk output ${job.id}`);
     } catch (error) {
       notify(ctx, error instanceof Error ? error.message : String(error), 'error');
     }
@@ -201,21 +209,12 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       if (request.condition && !session.lastRootId) throw new Error('No predecessor root job in this session');
       await deps.ensureWorker(dir);
       if (current(ctx) !== session) throw new Error('Session changed while starting worker; retry submission');
-      let job: Job | undefined;
-      for (let attempt = 0; attempt < 30; attempt++) {
-        try {
-          job = deps.admitJob(dir, {
-            name: generateWorkItemName(), request, ownerId: session.ownerId,
-            ...(request.condition ? { condition: request.condition, predecessorId: session.lastRootId } : {}),
-            projectRoot: root, cwd: resolve(ctx.cwd), ...(handoff ? { handoff } : {}),
-            ...(focus ? { focus } : {}),
-          });
-          break;
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        }
-      }
-      if (!job) throw new Error('could not allocate unique work-item name after 30 attempts');
+      const job = admitNamed(dir, {
+        request, ownerId: session.ownerId,
+        ...(request.condition ? { condition: request.condition, predecessorId: session.lastRootId } : {}),
+        projectRoot: root, cwd: resolve(ctx.cwd), ...(handoff ? { handoff } : {}),
+        ...(focus ? { focus } : {}),
+      });
       session.lastRootId = job.id;
       if (handoff) {
         pending = { jobId: job.id, dir, ownerId: session.ownerId, ctx, snapshot: handoff.snapshot, toolSeen: false };

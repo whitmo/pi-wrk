@@ -33,7 +33,12 @@ async function main(args) {
   if (args[0] !== id && !['queued', 'running', 'routing', 'uncertain'].includes(job.status)) throw new Error(`no active job named ${args[0]}`);
   if (command === 'status') console.log(JSON.stringify(job, null, 2));
   if (command === 'output') process.stdout.write(readJobOutput(storeDir, job.id));
-  if (command === 'cancel') { requestCancel(storeDir, job.id, args[0] !== id ? args[0] : undefined); console.log(`${job.id}: cancellation requested`); }
+  if (command === 'cancel') {
+    if (job.request.runner === 'btw' && job.status === 'running')
+      throw new Error('Cannot cancel in-flight BTW query; wait for the side conversation or close its session');
+    requestCancel(storeDir, job.id, args[0] !== id ? args[0] : undefined);
+    console.log(`${job.id}: cancellation requested`);
+  }
 }
 
 main(process.argv.slice(2)).catch(error => { console.error(error.message); process.exitCode = 1; });

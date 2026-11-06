@@ -268,6 +268,21 @@ test('CLI lists labels with UUIDs, keeps legacy UUIDs, and resolves active label
   assert.equal(cli('status', legacy.id).status, 0);
 });
 
+test('CLI refuses cancellation of a running BTW query without creating a cancel marker', t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-cli-btw-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'wrk');
+  const job = admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root, initialStatus: 'running',
+    name: 'act.rock.3', request: { runner: 'btw', prompt: 'question', lifetime: 'session' } });
+  const bin = new URL('../bin/pi-wrk.mjs', import.meta.url).pathname;
+  for (const ref of [job.id, job.name]) {
+    const cancelled = spawnSync(process.execPath, [bin, 'cancel', ref, '--store', dir], { encoding: 'utf8' });
+    assert.notEqual(cancelled.status, 0);
+    assert.match(cancelled.stderr, /cannot cancel in-flight BTW/i);
+    assert.equal(existsSync(join(dir, 'cancels', `${job.id}.yaml`)), false);
+  }
+});
+
 test('real store shell job records output, exit and cancellation', async () => {
   const temp = mkdtempSync(join(tmpdir(), 'wrk-real-'));
   const dir = join(temp, 'wrk');

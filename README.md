@@ -41,6 +41,8 @@ settings or reload a running session.
   appear under `/wrk status <id>`, and `/wrk output <id>` shows the answer.
   Open `/btw` to follow up in the same side conversation. BTW jobs end when
   their submitting session ends; independent lifetime is not supported.
+  In-flight BTW queries cannot be cancelled individually; wait for the
+  answer or close the session.
 - `/& todo`: blocked until a real shared todo-provider adapter is wired.
   No task-provider bridge has been confirmed.
 - `/wrk` or `/wrk jobs`: list jobs and their names. `/wrk queues` lists
