@@ -11,7 +11,9 @@ const { createExtension } = await createJiti(import.meta.url).import('../extensi
 function harness({ startup = () => Promise.resolve(), parser, realStore } = {}) {
   const commands = new Map();
   const events = new Map();
+  const bus = new Map();
   const jobs = new Map();
+  const output = new Map();
   const notices = [];
   const ui = [];
   let serial = 0;
@@ -33,7 +35,7 @@ function harness({ startup = () => Promise.resolve(), parser, realStore } = {}) 
     parseRequest: parser ?? ((text, { alias }) => ({ runner: alias === '&' ? 'router' : 'agent', prompt: text.trim(), options: {}, queue: null, lifetime: 'session', handoff: !text.trim() })),
     storePath: () => '/project/.agents/wrk',
     admitJob: (_, input) => {
-      const job = { id: `job-${++serial}`, status: 'queued', ...input };
+      const job = { id: `job-${++serial}`, status: input.initialStatus ?? 'queued', ...input };
       jobs.set(job.id, job);
       return job;
     },
@@ -41,7 +43,8 @@ function harness({ startup = () => Promise.resolve(), parser, realStore } = {}) 
     getJob: (_, id) => { if (!jobs.has(id)) throw new Error(`unknown job ${id}`); return jobs.get(id); },
     updateJob: (_, id, patch) => Object.assign(jobs.get(id), patch),
     requestCancel: (_, id) => { if (!jobs.has(id)) throw new Error('unknown job'); jobs.get(id).cancelRequested = true; },
-    readJobOutput: (_, id) => `output ${id}`,
+    readJobOutput: (_, id) => output.get(id) ?? `output ${id}`,
+    appendJobOutput: (_, id, text) => output.set(id, `${output.get(id) ?? ''}${text}`),
     readNotices: () => notices,
     writeNotice: (_, notice) => notices.push(notice),
     touchOwner: (_, id) => ui.push({ touched: id }),
@@ -53,14 +56,66 @@ function harness({ startup = () => Promise.resolve(), parser, realStore } = {}) 
     newOwnerId: () => `owner-${owner}`,
   };
   if (realStore) Object.assign(deps, store, { storePath: () => realStore });
-  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), on: (name, handler) => events.set(name, handler) };
+  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), on: (name, handler) => events.set(name, handler), events: { emit: (name, payload) => bus.get(name)?.(payload) } };
   createExtension(pi, deps);
   const command = (name, input = '') => commands.get(name)(input, ctx);
   const event = (name, payload = {}, context = ctx) => events.get(name)?.(payload, context);
-  return { command, event, ctx, jobs, ui, branch, notices, tick: () => heartbeat?.(), get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
+  return { command, event, onBus: (name, handler) => bus.set(name, handler), ctx, jobs, ui, branch, notices, tick: () => heartbeat?.(), get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
 }
 
 const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+test('BTW submission stays in the current session and publishes an inspectable answer', async () => {
+  const h = harness();
+  h.event('session_start');
+  let request;
+  h.onBus('pi-wrk:btw-submit', (payload) => { request = payload; payload.accept(); });
+  await h.command('wrk', 'btw explain this deployment');
+  assert.equal(request.question, 'explain this deployment');
+  assert.equal(request.ctx, h.ctx);
+  assert.equal(h.starts, 0, 'a local BTW job must not start the external worker');
+  assert.equal(h.aborted, 0);
+  assert.equal(h.jobs.size, 1);
+  const job = [...h.jobs.values()][0];
+  assert.equal(job.status, 'running');
+  assert.equal(job.request.runner, 'btw');
+  request.done({ answer: 'Keep the backend stable.' });
+  await flush();
+  assert.equal(job.status, 'succeeded');
+  await h.command('wrk', `output ${job.id}`);
+  assert.match(h.ui.at(-1).message, /Keep the backend stable/);
+  await h.command('wrk', `status ${job.id}`);
+  assert.match(h.ui.at(-1).message, /succeeded/);
+});
+
+test('BTW submission fails visibly if BTW is missing or the query fails', async () => {
+  const h = harness();
+  h.event('session_start');
+  await h.command('wrk', 'btw no extension installed');
+  const missing = [...h.jobs.values()][0];
+  assert.equal(missing.status, 'failed');
+  assert.match(missing.error, /pi-btw.*unavailable/i);
+  h.onBus('pi-wrk:btw-submit', (request) => { request.accept(); request.done({ error: 'No credentials available' }); });
+  await h.command('wrk', 'btw need credentials');
+  const failed = [...h.jobs.values()][1];
+  assert.equal(failed.status, 'failed');
+  assert.match(failed.error, /No credentials/);
+  await h.command('wrk', `status ${failed.id}`);
+  assert.match(h.ui.at(-1).message, /No credentials/);
+});
+
+test('BTW running job is failed if its owning session closes', async () => {
+  const h = harness();
+  h.event('session_start');
+  let request;
+  h.onBus('pi-wrk:btw-submit', (payload) => { request = payload; payload.accept(); });
+  await h.command('wrk', 'btw long thought');
+  const job = [...h.jobs.values()][0];
+  h.event('session_shutdown');
+  assert.equal(job.status, 'failed');
+  request.done({ answer: 'Late reply' });
+  assert.equal(job.status, 'failed', 'late responses must not overwrite a failed job');
+});
 
 test('submission persists current focus before queueing and respects later clear and opt-out', async t => {
   const { entry } = await import('./fixtures/focus.mjs');

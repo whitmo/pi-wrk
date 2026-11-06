@@ -118,6 +118,32 @@ test('restart holds unknown active mutation and prevents newly queued work', asy
   } finally { await worker.stop(); }
 });
 
+test('worker leaves session-owned BTW jobs to the Pi extension', async () => {
+  const f = fixture([
+    { id: 'btw-live', status: 'running', request: { runner: 'btw', lifetime: 'session' } },
+    { id: 'btw-orphan', status: 'queued', request: { runner: 'btw', lifetime: 'session' } },
+    { id: 'normal' },
+  ]);
+  let calls = 0;
+  const worker = await running(f, { agent: async () => { calls++; return {}; } });
+  try {
+    await until(() => f.items.get('normal').status === 'succeeded');
+    await until(() => f.items.get('btw-orphan').status === 'failed');
+    assert.equal(f.items.get('btw-live').status, 'running');
+    assert.equal(calls, 1);
+  } finally { await worker.stop(); }
+});
+
+test('worker fails session-owned BTW jobs when the owning Pi session expires', async () => {
+  const f = fixture([{ id: 'btw-live', status: 'running', request: { runner: 'btw', lifetime: 'session' } }]);
+  f.store.ownerAlive = () => false;
+  const worker = await running(f, {});
+  try {
+    await until(() => f.items.get('btw-live').status === 'failed');
+    assert.match(f.items.get('btw-live').error, /session.*ended/i);
+  } finally { await worker.stop(); }
+});
+
 test('parent may wait on child without occupying the last scheduler slot', async () => {
   const f = fixture([{ id: 'parent', request: { runner: 'council', prompt: 'assess' } }]);
   const worker = await running(f, {

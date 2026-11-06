@@ -21,6 +21,7 @@ type Job = {
   ownerId: string;
   handoff?: { ready: boolean; snapshot: Snapshot; reason?: string };
   error?: string;
+  finishedAt?: string;
 };
 type Session = {
   getSessionId(): string;
@@ -33,17 +34,20 @@ type Context = {
   isIdle(): boolean;
   abort(): void;
 };
-type Pi = Pick<ExtensionAPI, 'registerCommand' | 'on'>;
+type BtwResult = { answer?: string; error?: string };
+type BtwSubmission = { ctx: Context; question: string; accept(): void; done(result: BtwResult): void };
+type Pi = Pick<ExtensionAPI, 'registerCommand' | 'on' | 'events'>;
 type Dependencies = {
   parseRequest(text: string, options: { alias: string }): Request;
   storePath(root: string): string;
-  admitJob(dir: string, input: { request: Request; ownerId: string; projectRoot: string; cwd: string; handoff?: Job['handoff']; focus?: unknown }): Job;
+  admitJob(dir: string, input: { request: Request; ownerId: string; projectRoot: string; cwd: string; handoff?: Job['handoff']; focus?: unknown; initialStatus?: 'running' }): Job;
   listJobs(dir: string): Job[];
   listQueues?(dir: string): Array<{ name: string }>;
   getJob(dir: string, id: string): Job;
   updateJob(dir: string, id: string, patch: Partial<Job>): Job;
   requestCancel(dir: string, id: string): void;
   readJobOutput(dir: string, id: string): string;
+  appendJobOutput(dir: string, id: string, text: string): void;
   readNotices(dir: string, ownerId: string): Array<{ id?: string; jobId: string; message: string; kind?: string; createdAt?: string }>;
   writeNotice?(dir: string, notice: { ownerId: string; jobId: string; message: string; kind: string }): void;
   touchOwner(dir: string, ownerId: string): void;
@@ -78,6 +82,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   let turn: { sessionId: string; prompt: string; toolSeen: boolean; outcome?: string } | undefined;
   let pending: { jobId: string; snapshot: Snapshot; dir: string; ownerId: string; ctx: Context; outcome?: string; toolSeen: boolean } | undefined;
   const startupErrors = new Map<string, string>();
+  const btwJobs = new Map<string, (result: BtwResult) => void>();
 
   function current(ctx: Context) {
     if (active?.sessionId === ctx.sessionManager.getSessionId()) return active;
@@ -105,6 +110,46 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
         notify(ctx, message, 'error');
       }
     });
+  }
+  function submitBtw(question: string, ctx: Context) {
+    try {
+      const session = current(ctx);
+      if (!session) throw new Error('Session owner unavailable; retry after session start');
+      if (!question.trim()) throw new Error('Usage: /wrk btw <question>');
+      const dir = session.dir;
+      const root = deps.projectRoot(ctx.cwd);
+      const job = deps.admitJob(dir, {
+        request: { runner: 'btw', prompt: question.trim(), options: {}, queue: null, lifetime: 'session', handoff: false },
+        ownerId: session.ownerId, projectRoot: root, cwd: resolve(ctx.cwd), initialStatus: 'running',
+      });
+      const done = (result: BtwResult) => {
+        if (!btwJobs.delete(job.id)) return;
+        try {
+          if (deps.getJob(dir, job.id).status !== 'running') return;
+          const error = result.error || (!result.answer ? 'BTW request finished without an answer' : undefined);
+          if (!error) deps.appendJobOutput(dir, job.id, result.answer!);
+          const status = error ? 'failed' : 'succeeded';
+          deps.updateJob(dir, job.id, { status, ...(error ? { error } : {}), finishedAt: new Date().toISOString() });
+          deps.writeNotice?.(dir, { ownerId: session.ownerId, jobId: job.id,
+            message: `${job.id}: ${status}${error ? ` — ${error}` : ''}`, kind: status });
+        } catch (failure) {
+          notify(ctx, `BTW ${job.id}: ${failure instanceof Error ? failure.message : String(failure)}`, 'error');
+        }
+      };
+      btwJobs.set(job.id, done);
+      let accepted = false;
+      try {
+        pi.events.emit('pi-wrk:btw-submit', {
+          ctx, question: question.trim(), accept: () => { accepted = true; }, done,
+        } satisfies BtwSubmission);
+      } catch (error) {
+        done({ error: error instanceof Error ? error.message : String(error) });
+      }
+      if (!accepted) done({ error: 'pi-btw background query adapter unavailable; install the integrated pi-btw extension' });
+      notify(ctx, `${job.id} BTW ${deps.getJob(dir, job.id).status}; inspect with /wrk status ${job.id} or /wrk output ${job.id}`);
+    } catch (error) {
+      notify(ctx, error instanceof Error ? error.message : String(error), 'error');
+    }
   }
   function submit(alias: string, args: string, ctx: Context) {
     try {
@@ -161,10 +206,15 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
         notify(ctx, jobs.length ? jobs.map((job) => `${job.id} ${job.status}${job.handoff && !job.handoff.ready ? ` (handoff blocked: ${job.handoff.reason})` : ''}`).join('\n') : 'No jobs');
         return;
       }
+      if (verb === 'btw') { submitBtw(args.trim().slice(3).trim(), ctx); return; }
       if (['status', 'output', 'cancel'].includes(verb)) {
         if (!id || extra) throw new Error(`Usage: /wrk ${verb} <id>`);
         const job = deps.getJob(dir, id);
         if (verb === 'cancel') {
+          if (job.request.runner === 'btw' && job.status === 'running') {
+            notify(ctx, `Cannot cancel in-flight BTW ${id}; the side conversation must finish or the session must close`, 'warning');
+            return;
+          }
           deps.requestCancel(dir, id);
           notify(ctx, `Cancellation requested for ${id}; status remains ${job.status} until worker confirms`);
         } else if (verb === 'output') {
@@ -184,6 +234,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   pi.registerCommand('wrk', { description: 'Submit or inspect background jobs', handler: async (args, ctx) => manage(args, ctx) });
 
   pi.on('session_start', (_event, ctx) => {
+    for (const done of btwJobs.values()) done({ error: 'Owning Pi session changed before BTW replied' });
     if (active) { deps.clearInterval(active.timer); deps.closeOwner(active.dir, active.ownerId); active = undefined; }
     if (pending) block('Session changed before the foreground settled');
     const dir = deps.storePath(deps.projectRoot(ctx.cwd));
@@ -210,6 +261,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   });
   pi.on('session_shutdown', (_event, ctx) => {
     if (active?.sessionId !== ctx.sessionManager.getSessionId()) return;
+    for (const done of btwJobs.values()) done({ error: 'Owning Pi session closed before BTW replied' });
     if (active) { deps.clearInterval(active.timer); deps.closeOwner(active.dir, active.ownerId); active = undefined; }
     if (pending) block('Session closed before the foreground settled');
     turn = undefined;
@@ -250,7 +302,7 @@ export default async function extension(pi: ExtensionAPI): Promise<void> {
     storePath: store.storePath,
     admitJob: store.admitJob, listJobs: store.listJobs, listQueues: store.listQueues, getJob: store.getJob,
     updateJob: store.updateJob, requestCancel: store.requestCancel,
-    readJobOutput: store.readJobOutput, readNotices: store.readNotices,
+    readJobOutput: store.readJobOutput, appendJobOutput: store.appendJobOutput, readNotices: store.readNotices,
     writeNotice: store.writeNotice, touchOwner: store.touchOwner,
     closeOwner: store.closeOwner, ensureWorker: worker.ensureWorker,
     projectRoot, setInterval, clearInterval, newOwnerId: randomUUID,
