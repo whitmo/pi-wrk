@@ -9,6 +9,25 @@ function git(cwd, args) {
   return result.stdout.trim();
 }
 
+export function createAt7Workspace(projectRoot, workingDirectory) {
+  const root = realpathSync(projectRoot);
+  const cwd = realpathSync(workingDirectory);
+  const inside = relative(root, cwd);
+  if (inside === '..' || inside.startsWith('..' + (process.platform === 'win32' ? '\\' : '/')) || isAbsolute(inside))
+    throw new Error('@@7 cwd must be inside its owner checkout');
+  if (git(root, ['rev-parse', '--show-toplevel']) !== root) throw new Error('@@7 requires a Git checkout root');
+  const exclude = resolve(root, git(root, ['rev-parse', '--git-path', 'info/exclude']));
+  mkdirSync(dirname(exclude), { recursive: true });
+  const pattern = '/.agents/worktrees/wrk-*/';
+  if (!existsSync(exclude) || !readFileSync(exclude, 'utf8').split('\n').includes(pattern))
+    appendFileSync(exclude, `\n${pattern}\n`);
+  const branch = `wrk/at7-${randomUUID()}`;
+  const path = join(root, '.agents', 'worktrees', branch.replace('/', '-'));
+  mkdirSync(dirname(path), { recursive: true });
+  git(root, ['worktree', 'add', '-b', branch, path, 'HEAD']);
+  return { projectRoot: path, cwd: join(path, inside), branch };
+}
+
 export function createSwarmWorkspaces(job) {
   if (!isAbsolute(job.projectRoot) || !isAbsolute(job.cwd)) throw new Error('swarm requires absolute checkout paths');
   const root = realpathSync(job.projectRoot);
