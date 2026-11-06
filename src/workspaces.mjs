@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, realpathSync, existsSync, readFileSync, appendFileSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve, dirname } from 'node:path';
+import { mkdirSync, mkdtempSync, rmSync, realpathSync, existsSync, readFileSync, appendFileSync } from 'node:fs';
+import { isAbsolute, join, relative, resolve, dirname, basename, sep } from 'node:path';
+import { tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 
 function git(cwd, args) {
@@ -16,17 +17,26 @@ export function createAt7Workspace(projectRoot, workingDirectory) {
   if (inside === '..' || inside.startsWith('..' + (process.platform === 'win32' ? '\\' : '/')) || isAbsolute(inside))
     throw new Error('@@7 cwd must be inside its owner checkout');
   if (git(root, ['rev-parse', '--show-toplevel']) !== root) throw new Error('@@7 requires a Git checkout root');
-  const exclude = resolve(root, git(root, ['rev-parse', '--git-path', 'info/exclude']));
-  mkdirSync(dirname(exclude), { recursive: true });
-  const pattern = '/.agents/worktrees/wrk-*/';
-  if (!existsSync(exclude) || !readFileSync(exclude, 'utf8').split('\n').includes(pattern))
-    appendFileSync(exclude, `\n${pattern}\n`);
   const branch = `wrk/at7-${randomUUID()}`;
-  const path = join(root, '.agents', 'worktrees', branch.replace('/', '-'));
-  mkdirSync(dirname(path), { recursive: true });
-  git(root, ['worktree', 'add', '-b', branch, path, 'HEAD']);
+  const path = mkdtempSync(join(tmpdir(), 'wrk-at7-'));
+  try { git(root, ['worktree', 'add', '-b', branch, path, 'HEAD']); }
+  catch (error) { rmSync(path, { recursive: true, force: true }); throw error; }
   const target = join(path, inside);
   return { projectRoot: path, cwd: existsSync(target) ? target : path, branch };
+}
+
+/** Never force-remove worktrees with local changes; the branch keeps committed results. */
+export function cleanupAt7Workspace(projectRoot, workspace) {
+  const root = realpathSync(projectRoot);
+  const path = realpathSync(workspace);
+  if (!path.startsWith(realpathSync(tmpdir()) + sep) || !/^wrk-at7-[\w-]+$/.test(basename(path)))
+    throw new Error('@@7 cleanup refused an unrecognized worktree');
+  if (git(root, ['rev-parse', '--show-toplevel']) !== root ||
+      !git(root, ['worktree', 'list', '--porcelain']).split('\n').includes(`worktree ${path}`))
+    throw new Error('@@7 cleanup refused a foreign worktree');
+  if (git(path, ['status', '--porcelain'])) return false;
+  git(root, ['worktree', 'remove', '--', path]);
+  return true;
 }
 
 export function createSwarmWorkspaces(job) {

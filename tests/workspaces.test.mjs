@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { createAt7Workspace, createSwarmWorkspaces, integrateSwarm } from '../src/workspaces.mjs';
+import { createAt7Workspace, cleanupAt7Workspace, createSwarmWorkspaces, integrateSwarm } from '../src/workspaces.mjs';
 
 const git = (cwd, ...args) => {
   const result = spawnSync('git', ['-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8' });
@@ -37,6 +37,27 @@ test('@@7 triage gets its own worktree while the owner retains dirty files', t =
   commit(space, 'triage.txt', 'independent\n');
   assert.equal(readFileSync(join(root, 'base.txt'), 'utf8'), 'dirty owner\n');
   assert.equal(git(root, 'branch', '--show-current'), 'main');
+});
+
+test('terminal @@7 worktree removal keeps its commit branch and never edits shared exclude', t => {
+  const root = repo(t);
+  const exclude = git(root, 'rev-parse', '--git-path', 'info/exclude');
+  const before = readFileSync(join(root, exclude), 'utf8');
+  const space = createAt7Workspace(root, root);
+  assert.equal(readFileSync(join(root, exclude), 'utf8'), before);
+  commit(space, 'triage.txt', 'independent\n');
+  const head = git(space.projectRoot, 'rev-parse', 'HEAD');
+  assert.equal(cleanupAt7Workspace(root, space.projectRoot), true);
+  assert.equal(existsSync(space.projectRoot), false);
+  assert.equal(git(root, 'rev-parse', space.branch), head);
+});
+
+test('@@7 cleanup refuses dirty worktrees and preserves their files', t => {
+  const root = repo(t);
+  const space = createAt7Workspace(root, root);
+  writeFileSync(join(space.projectRoot, 'dirty.txt'), 'do not delete');
+  assert.equal(cleanupAt7Workspace(root, space.projectRoot), false);
+  assert.equal(readFileSync(join(space.projectRoot, 'dirty.txt'), 'utf8'), 'do not delete');
 });
 
 test('@@7 triage remains runnable when the owner works in an untracked subdirectory', t => {

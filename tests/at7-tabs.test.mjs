@@ -19,6 +19,15 @@ test('created tabs deliver first visible messages; visited tabs baseline and onl
   assert.equal(reads.includes('unrelated user-selected tab'), false);
 });
 
+test('newline-terminated visited baseline retains old lines without replay on appended output', async () => {
+  let snapshot = '@@7 old\n';
+  const tabs = createTabRegistry(async () => ({ tabId: 7, snapshot }));
+  tabs.visited('term');
+  await tabs.baseline('session', 'term');
+  snapshot = '@@7 old\n@@7 new\n';
+  assert.deepEqual((await tabs.scan('session', new Set())).map(item => item.text), ['new']);
+});
+
 test('a newly visited tab baselines before the first scan', async () => {
   let snapshot = '@@7 existing';
   const tabs = createTabRegistry(async () => ({ tabId: 7, snapshot }));
