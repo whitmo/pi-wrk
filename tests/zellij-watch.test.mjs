@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { readTab } from '../src/zellij-watch.mjs';
+import { readTab, readTabScreen } from '../src/zellij-watch.mjs';
 
 function fixture(panes, screens = {}) {
   const calls = [];
@@ -30,6 +30,12 @@ test('reads named tab without changing focus and detects later screen changes', 
   assert.equal(f.calls.some(call => call.includes('focus-pane-id') || call.includes('go-to-tab-name')), false);
   f.run = fixture(panes, { terminal_3: 'new output' }).run;
   assert.notEqual((await readTab('agent-session', { tabId: first.tabId }, f.run)).snapshot, first.snapshot);
+});
+
+test('message screen adapter reads visible text without changing watch hashing or focus', async () => {
+  const f = fixture(panes, { terminal_3: '@@7 question\n' });
+  assert.deepEqual(await readTabScreen('agent-session', { tabName: 'term' }, f.run), { tabId: 7, snapshot: '@@7 question\n' });
+  assert.equal(f.calls.some(call => call.includes('focus-pane-id')), false);
 });
 
 test('rejects missing, ambiguous, or empty terminal tabs and missing session', async () => {

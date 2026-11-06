@@ -80,6 +80,15 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
+test('explicit at7 tab registration does not start a watch or wake an idle session', async () => {
+  const h = harness({ readZellijTab: async () => ({ tabId: 9, snapshot: '@@7 old' }) });
+  await h.event('session_start');
+  await h.command('wrk', 'at7 tab my-tab');
+  assert.match(h.ui.at(-1).message, /my-tab/);
+  assert.equal(h.messages.length, 0);
+  assert.equal(h.jobs.size, 0);
+});
+
 test('Zellij watch wakes once on a later tab screen change, not on unchanged polls', async () => {
   let screen = 'initial';
   const reads = [];
