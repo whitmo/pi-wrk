@@ -109,6 +109,14 @@ test('next turn admits one @@7 job per key; reload and repeat keep it seen', asy
   assert.deepEqual(scopes, ['changed', 'changed', 'changed', 'all']);
 });
 
+test('terminal intake never scans when the owning Pi pane is unidentified', async () => {
+  const h = harness({ zellijPaneId: () => undefined, readZellijTab: async () => ({ tabId: 2, snapshot: '@@7 private Pi pane' }) });
+  await h.event('session_start');
+  await h.event('tool_call', { toolName: 'bash', input: { command: 'zellij action new-tab --name candidate' } });
+  await h.event('before_agent_start', { prompt: 'ordinary' });
+  assert.equal(h.jobs.size, 0);
+});
+
 test('tool-created eligible tab is scanned on next turn; unrelated selected tab is never read', async () => {
   const reads = [];
   const h = harness({ readZellijTab: async (_, selector) => { reads.push(selector.tabName); return { tabId: 2, snapshot: '@@7 terminal ask' }; } });

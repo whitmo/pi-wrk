@@ -129,7 +129,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       const fileMessages = await (deps.collectFileMessages ?? collectFileMessages)(root, scope, seen);
       if (current(ctx) !== session) return;
       const zellij = deps.zellijSessionName();
-      const tabMessages = zellij ? await tabs.scan(zellij, seen) : [];
+      const tabMessages = zellij && deps.zellijPaneId() !== undefined ? await tabs.scan(zellij, seen) : [];
       if (current(ctx) !== session) return;
       for (const item of [...fileMessages, ...tabMessages]) {
         if (seen.has(item.key)) continue;

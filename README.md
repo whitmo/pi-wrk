@@ -43,6 +43,8 @@ settings or reload a running session.
   their submitting session ends; independent lifetime is not supported.
   In-flight BTW queries cannot be cancelled individually; wait for the
   answer or close the session.
+- `@@7 <message>` in a comment (`// @@7 ...`, `# @@7 ...`) in a Git-changed work file is checked on the **next agent turn**, not while idle. Staged, unstaged and untracked added comment lines qualify; unchanged old markers do not. `/wrk at7 scan --all` deliberately includes old comments across tracked and untracked (not ignored) files. The same source/location/text is sent once per Pi session, including after reload.
+  Eligible Zellij tabs are those Pi tool calls visibly create or visit by name, or those you explicitly register with `/wrk at7 tab <name>`; an existing tab is baselined first. Merely switching focus does not register a tab. Visible `@@7 <message>` lines count, but shell commands mentioning the marker do not; output that scrolls away before the next turn cannot be recovered. No idle wake is added. A background triager answers in the Pi transcript without starting a turn, or commits independent reversible changes in its own retained worktree; requests concerning the owner's dirty files are handed back for the owner to edit. Check `/wrk status <id>` for the full job. Markers are not approval for external or irreversible actions.
 - `/watch:zellij <tab name>`: in this Pi agent's Zellij session,
   snapshot the named tab and wake this agent once when its terminal
   viewport changes, including changes before the first poll. Requires

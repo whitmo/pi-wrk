@@ -1,13 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createJiti } from 'jiti';
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, mkdirSync, rmSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 
 const { collectFileMessages } = await createJiti(import.meta.url).import('../extensions/at7-files.ts');
 const git = (root, ...args) => execFileSync('git', ['-C', root, ...args]);
+
+test('tracked symlink pointing outside the worktree is never read as a work file', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'at7-symlink-'));
+  const outside = mkdtempSync(join(tmpdir(), 'at7-private-'));
+  t.after(() => { rmSync(root, { recursive: true, force: true }); rmSync(outside, { recursive: true, force: true }); });
+  git(root, 'init', '-q');
+  writeFileSync(join(outside, 'private.txt'), '# @@7 never read');
+  symlinkSync(join(outside, 'private.txt'), join(root, 'pointer'));
+  git(root, 'add', 'pointer');
+  assert.deepEqual(await collectFileMessages(root, 'all', new Set()), []);
+});
 
 test('changed scope only collects added comment markers across staged, unstaged and untracked files', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'at7-files-'));
