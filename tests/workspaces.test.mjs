@@ -52,6 +52,23 @@ test('terminal @@7 worktree removal keeps its commit branch and never edits shar
   assert.equal(git(root, 'rev-parse', space.branch), head);
 });
 
+test('clean zero-commit @@7 cleanup removes both worktree and idle branch', t => {
+  const root = repo(t);
+  const space = createAt7Workspace(root, root);
+  assert.equal(cleanupAt7Workspace(root, space.projectRoot), true);
+  assert.equal(existsSync(space.projectRoot), false);
+  assert.equal(git(root, 'branch', '--list', space.branch), '');
+});
+
+test('zero-commit @@7 branch is removed even after owner advances', t => {
+  const root = repo(t);
+  const space = createAt7Workspace(root, root);
+  writeFileSync(join(root, 'owner.txt'), 'new owner work\n');
+  git(root, 'add', 'owner.txt'); git(root, 'commit', '-qm', 'owner work');
+  assert.equal(cleanupAt7Workspace(root, space.projectRoot, space.baseCommit), true);
+  assert.equal(git(root, 'branch', '--list', space.branch), '');
+});
+
 test('@@7 cleanup refuses dirty worktrees and preserves their files', t => {
   const root = repo(t);
   const space = createAt7Workspace(root, root);
