@@ -109,6 +109,17 @@ test('next turn admits one @@7 job per key; reload and repeat keep it seen', asy
   assert.deepEqual(scopes, ['changed', 'changed', 'changed', 'all']);
 });
 
+test('Pi-mediated Zellij commands with an explicit session still identify named tabs', async () => {
+  const h = harness({ readZellijTab: async () => ({ tabId: 2, snapshot: '@@7 session option' }) });
+  await h.event('session_start');
+  await h.event('tool_call', { toolName: 'bash', input: { command: 'zellij --session agent-zellij action new-tab --name build' } });
+  await h.event('before_agent_start', { prompt: 'continue' });
+  assert.equal(h.jobs.size, 1);
+  await h.event('tool_call', { toolName: 'bash', input: { command: 'zellij --session someone-else action new-tab --name other' } });
+  await h.event('before_agent_start', { prompt: 'again' });
+  assert.equal(h.jobs.size, 1);
+});
+
 test('terminal intake never scans when the owning Pi pane is unidentified', async () => {
   const h = harness({ zellijPaneId: () => undefined, readZellijTab: async () => ({ tabId: 2, snapshot: '@@7 private Pi pane' }) });
   await h.event('session_start');
