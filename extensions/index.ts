@@ -77,8 +77,8 @@ type Dependencies = {
   readZellijTab(sessionName: string, selector: { tabName?: string; tabId?: number; ownPaneId?: number }): Promise<{ tabId: number; snapshot: string }>;
   readZellijScreen?(sessionName: string, selector: { tabName?: string; tabId?: number; ownPaneId?: number }): Promise<{ tabId: number; snapshot: string }>;
   collectFileMessages?(root: string, scope: 'changed' | 'all', seen: ReadonlySet<string>): Promise<At7Message[]>;
-  createAt7Workspace?(root: string, cwd: string): { projectRoot: string; cwd: string; branch: string };
-  cleanupAt7Workspace?(root: string, workspace: string): boolean;
+  createAt7Workspace?(root: string, cwd: string): { projectRoot: string; cwd: string; branch: string; baseCommit?: string };
+  cleanupAt7Workspace?(root: string, workspace: string, baseCommit?: string): boolean;
 };
 
 function projectRoot(cwd: string): string {
@@ -120,7 +120,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   const tabs = createTabRegistry(deps.readZellijScreen ?? deps.readZellijTab, deps.zellijPaneId);
   const seen = new Set<string>();
   const at7Jobs = new Set<string>();
-  type At7Journal = { jobId: string; key: string; ownerId: string; root: string; workspace: string; state: 'pending' | 'delivered' | 'cleaned' | 'retained' };
+  type At7Journal = { jobId: string; key: string; ownerId: string; root: string; workspace: string; baseCommit?: string; state: 'pending' | 'delivered' | 'cleaned' | 'retained' };
   const journal = new Map<string, At7Journal>();
   const inFlightAt7 = new Set<string>();
   function displayedAt7(ctx: Context, jobId: string) {
@@ -160,10 +160,10 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
             ownerId: session.ownerId, projectRoot: workspace.projectRoot, cwd: workspace.cwd,
           });
         } catch (error) {
-          deps.cleanupAt7Workspace?.(root, workspace.projectRoot);
+          deps.cleanupAt7Workspace?.(root, workspace.projectRoot, workspace.baseCommit);
           throw error;
         }
-        recordAt7({ jobId: job.id, key: item.key, ownerId: session.ownerId, root, workspace: workspace.projectRoot, state: 'pending' });
+        recordAt7({ jobId: job.id, key: item.key, ownerId: session.ownerId, root, workspace: workspace.projectRoot, baseCommit: workspace.baseCommit, state: 'pending' });
         at7Jobs.add(job.id);
         seen.add(item.key);
         pi.appendEntry('wrk-at7-seen', { keys: [...seen] });
@@ -484,7 +484,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
             inFlightAt7.delete(job.id);
           }
           if (deps.cleanupAt7Workspace) {
-            const cleaned = deps.cleanupAt7Workspace(entry.root, entry.workspace);
+            const cleaned = deps.cleanupAt7Workspace(entry.root, entry.workspace, entry.baseCommit);
             recordAt7({ ...entry, state: cleaned ? 'cleaned' : 'retained' });
             if (!cleaned) notify(ctx, `@@7 worktree retained with uncommitted changes: ${entry.workspace}`, 'warning');
           }
@@ -601,6 +601,6 @@ export default async function extension(pi: ExtensionAPI): Promise<void> {
     readZellijScreen: readTabScreen,
     collectFileMessages,
     createAt7Workspace: (root, cwd) => workspaces.createAt7Workspace(root, cwd),
-    cleanupAt7Workspace: (root, path) => workspaces.cleanupAt7Workspace(root, path),
+    cleanupAt7Workspace: (root, path, baseCommit) => workspaces.cleanupAt7Workspace(root, path, baseCommit),
   });
 }

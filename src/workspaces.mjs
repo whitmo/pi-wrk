@@ -18,15 +18,16 @@ export function createAt7Workspace(projectRoot, workingDirectory) {
     throw new Error('@@7 cwd must be inside its owner checkout');
   if (git(root, ['rev-parse', '--show-toplevel']) !== root) throw new Error('@@7 requires a Git checkout root');
   const branch = `wrk/at7-${randomUUID()}`;
+  const baseCommit = git(root, ['rev-parse', 'HEAD']);
   const path = mkdtempSync(join(tmpdir(), 'wrk-at7-'));
   try { git(root, ['worktree', 'add', '-b', branch, path, 'HEAD']); }
   catch (error) { rmSync(path, { recursive: true, force: true }); throw error; }
   const target = join(path, inside);
-  return { projectRoot: path, cwd: existsSync(target) ? target : path, branch };
+  return { projectRoot: path, cwd: existsSync(target) ? target : path, branch, baseCommit };
 }
 
-/** Never force-remove worktrees with local changes; the branch keeps committed results. */
-export function cleanupAt7Workspace(projectRoot, workspace) {
+/** Never force-remove dirty worktrees; retain branches with triage commits. */
+export function cleanupAt7Workspace(projectRoot, workspace, baseCommit = git(projectRoot, ['rev-parse', 'HEAD'])) {
   const root = realpathSync(projectRoot);
   const path = realpathSync(workspace);
   if (!path.startsWith(realpathSync(tmpdir()) + sep) || !/^wrk-at7-[\w-]+$/.test(basename(path)))
@@ -35,7 +36,11 @@ export function cleanupAt7Workspace(projectRoot, workspace) {
       !git(root, ['worktree', 'list', '--porcelain']).split('\n').includes(`worktree ${path}`))
     throw new Error('@@7 cleanup refused a foreign worktree');
   if (git(path, ['status', '--porcelain'])) return false;
+  const branch = git(path, ['branch', '--show-current']);
+  const unchanged = git(path, ['rev-parse', 'HEAD']) === baseCommit;
   git(root, ['worktree', 'remove', '--', path]);
+  if (unchanged && /^wrk\/at7-[a-f0-9-]+$/.test(branch))
+    git(root, ['update-ref', '-d', `refs/heads/${branch}`, baseCommit]);
   return true;
 }
 

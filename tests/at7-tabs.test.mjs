@@ -28,6 +28,15 @@ test('newline-terminated visited baseline retains old lines without replay on ap
   assert.deepEqual((await tabs.scan('session', new Set())).map(item => item.text), ['new']);
 });
 
+test('multiple trailing blank lines in a visited baseline do not replay its old marker', async () => {
+  let snapshot = '@@7 old\n\n';
+  const tabs = createTabRegistry(async () => ({ tabId: 7, snapshot }));
+  tabs.visited('term');
+  await tabs.baseline('session', 'term');
+  snapshot = '@@7 old\n@@7 new\n';
+  assert.deepEqual((await tabs.scan('session', new Set())).map(item => item.text), ['new']);
+});
+
 test('a newly visited tab baselines before the first scan', async () => {
   let snapshot = '@@7 existing';
   const tabs = createTabRegistry(async () => ({ tabId: 7, snapshot }));
