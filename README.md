@@ -38,6 +38,15 @@ settings or reload a running session.
   active jobs; UUIDs also work for completed jobs. Cancellation is not
   proof of termination.
 
+`/&&` and `/||` condition a new job on the preceding root job in this Pi
+session: success or failure status, respectively. `/~&&` and `/~||`
+require an explicit `success` or `failure` semantic verdict from a
+worker-owned agent's `wrk_message` tool; an absent verdict satisfies
+neither edge. A skipped or uncertain predecessor never starts its child.
+For bounded check/fix loops and safe deploy ordering, see the `and-do`,
+`or-do` and `until-true` skills. Only one predecessor is tracked; these
+commands do not implement automatic loops.
+
 Worker-owned agents have a `wrk_message` tool for questions, blockers and
 results. The submitting session displays durable notices on its heartbeat,
 without injecting a foreground prompt or model turn. Notices remain on disk
@@ -54,7 +63,8 @@ The default `session` lifetime ends with the submitting session's lease,
 including queued work. Prefix a request with `--lifetime independent` to
 keep it running after the session closes, e.g.
 `/bg --lifetime independent Review logs`. A receipt says **queued**, not
-running. Jobs are scoped to the resolved project root and retain the
+running. Named queue jobs run one at a time in admission order, including
+jobs created in the same millisecond. Jobs are scoped to the resolved project root and retain the
 submission cwd. CLI inspection is also available with
 `node bin/pi-wrk.mjs jobs --store <absolute-store-path>`.
 
@@ -65,7 +75,10 @@ aborted settlement. Completed requests are refused. Any tool call before
 handoff is refused, since it may already have changed state; uncertainty
 leaves a visible blocked job rather than replaying possible mutations.
 A model invocation cannot be transplanted. Submit a new explicit prompt
-if the conservative handoff guard refuses the request.
+if the conservative handoff guard refuses the request. Worker-owned Pi
+agents retry at most three comparable, authenticated models only when a
+provider failure is proven to have occurred before any tool starts.
+Possible mutations, ambiguous failures and cancellation are not retried.
 
 ## Focus inheritance
 
