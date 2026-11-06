@@ -6,7 +6,7 @@ import { join, resolve } from 'node:path';
 import { parse } from 'yaml';
 import { spawn } from 'node:child_process';
 import {
-  storePath, admitJob, listJobs, getJob, updateJob, requestCancel,
+  storePath, admitJob, listJobs, listWorkerJobs, getJob, updateJob, requestCancel, claimQueuedJob,
   isCancelRequested, touchOwner, closeOwner, ownerAlive, readJobOutput,
   appendJobOutput, writeNotice, readNotices, listQueues,
 } from '../src/store.mjs';
@@ -119,6 +119,36 @@ test('cancellation markers are separate and durable, leases expire or close', t 
   assert.equal(ownerAlive(dir, 'owner-1'), false);
   assert.equal(ownerAlive(dir, 'missing'), false);
   assert.throws(() => requestCancel(dir, '11111111-1111-4111-8111-111111111111'), /missing|not found/i);
+});
+
+test('queued claim and cancellation serialize under the same job lock', t => {
+  const { dir, input } = fixture(t);
+  touchOwner(dir, input.ownerId);
+  const cancelled = admitJob(dir, input);
+  requestCancel(dir, cancelled.id);
+  assert.equal(claimQueuedJob(dir, cancelled.id, { leaseMs: 15000, startStatus: 'running' }), null);
+  assert.equal(getJob(dir, cancelled.id).status, 'queued');
+  const started = admitJob(dir, input);
+  assert.equal(claimQueuedJob(dir, started.id, { leaseMs: 15000, startStatus: 'running' }).status, 'running');
+  requestCancel(dir, started.id);
+  assert.equal(isCancelRequested(dir, started.id), true);
+  assert.equal(claimQueuedJob(dir, started.id, { leaseMs: 15000, startStatus: 'running' }), null);
+  closeOwner(dir, input.ownerId);
+  const expired = admitJob(dir, input);
+  assert.equal(claimQueuedJob(dir, expired.id, { leaseMs: 15000, startStatus: 'running' }), null);
+});
+
+test('worker inventory refuses a corrupt job that normal listings omit', t => {
+  const { dir, input } = fixture(t);
+  const job = admitJob(dir, input);
+  const path = join(dir, 'jobs', `${job.id}.yaml`);
+  const original = readFileSync(path);
+  writeFileSync(path, 'invalid: [');
+  assert.deepEqual(listJobs(dir), []);
+  assert.throws(() => listWorkerJobs(dir), /corrupt|yaml|invalid/i);
+  writeFileSync(path, original);
+  updateJob(dir, job.id, { status: 'runningg' });
+  assert.throws(() => listWorkerJobs(dir), /corrupt|invalid/i);
 });
 
 test('output retention is bounded and reads a UTF-8-safe byte tail', t => {

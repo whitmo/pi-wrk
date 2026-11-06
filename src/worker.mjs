@@ -39,6 +39,12 @@ function identity(storeDir) {
   catch { return null; }
 }
 
+function workerDefinitelyDead(owner) {
+  if (!Number.isSafeInteger(owner?.pid) || owner.pid <= 0) return false;
+  try { process.kill(owner.pid, 0); return false; }
+  catch (error) { return error.code === 'ESRCH'; }
+}
+
 function ping(storeDir, token, timeoutMs = 400) {
   return new Promise(resolveReady => {
     if (!token) return resolveReady(false);
@@ -59,6 +65,11 @@ export async function ensureWorker(storeDir, { workerCommand = process.execPath,
   if (existing && await ping(storeDir, existing.token)) {
     if (existing.protocolVersion !== protocolVersion) throw incompatibleWorker();
     return;
+  }
+  if (existing && !workerDefinitelyDead(existing)) throw new Error('worker owner unresponsive; cannot prove it is dead');
+  if (!existing) {
+    try { statSync(join(storeDir, lockName)); throw new Error('worker owner unknown; cannot prove it is dead'); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
   }
   const log = openSync(join(storeDir, 'worker.log'), 'a', 0o600);
   let child;
@@ -88,6 +99,7 @@ async function ownWorker(storeDir) {
   mkdirSync(storeDir, { recursive: true, mode: 0o700 });
   const lock = join(storeDir, lockName);
   const sock = socketPath(storeDir);
+  const reclaim = join(storeDir, 'worker.reclaim.lock');
   const token = randomUUID();
   for (;;) {
     try {
@@ -101,8 +113,25 @@ async function ownWorker(storeDir) {
       if (current && await ping(storeDir, current.token)) throw new Error('worker already running');
       try {
         if (Date.now() - statSync(lock).mtimeMs < 10000) { await delay(100); continue; }
-        if (current?.token === identity(storeDir)?.token) unlinkSync(lock);
       } catch (problem) { if (problem.code !== 'ENOENT') throw problem; }
+      let gate;
+      try { gate = openSync(reclaim, 'wx', 0o600); }
+      catch (problem) {
+        if (problem.code !== 'EEXIST') throw problem;
+        try {
+          if (Date.now() - statSync(reclaim).mtimeMs > 10000) throw new Error('worker lock reclamation abandoned; inspect worker.reclaim.lock');
+        } catch (error) { if (error.code !== 'ENOENT') throw error; }
+        await delay(100);
+        continue;
+      }
+      try {
+        const owner = identity(storeDir);
+        if (!owner) { statSync(lock); throw new Error('worker owner unknown; cannot prove it is dead'); }
+        if (Date.now() - statSync(lock).mtimeMs < 10000) continue;
+        if (!workerDefinitelyDead(owner)) throw new Error('worker owner unresponsive; cannot prove it is dead');
+        if (owner.token === identity(storeDir)?.token) unlinkSync(lock);
+      } catch (problem) { if (problem.code !== 'ENOENT') throw problem; }
+      finally { closeSync(gate); unlinkSync(reclaim); }
     }
   }
   try { unlinkSync(sock); } catch (error) { if (error.code !== 'ENOENT') throw error; }
@@ -137,10 +166,11 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
   };
   const cancel = (job, status = 'cancelled') => notice(update(job.id, { status, finishedAt: new Date().toISOString() }));
   function launch(job) {
+    const startStatus = job.request.runner === 'router' ? 'routing' : 'running';
+    job = store.claimQueuedJob(storeDir, job.id, { leaseMs, startStatus });
+    if (!job) return false; // Cancellation or owner expiry won the claim.
     const controller = new AbortController();
     active.set(job.id, controller);
-    const startStatus = job.request.runner === 'router' ? 'routing' : 'running';
-    update(job.id, { status: startStatus, startedAt: new Date().toISOString() });
     const allowedWorkspaces = new Set();
     const context = {
       signal: controller.signal,
@@ -198,15 +228,16 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
       promises.delete(work);
       console.error(`job ${job.id} persistence failed: ${errorText(error)}`);
     });
+    return true;
   }
   try {
-    for (const job of store.listJobs(storeDir)) {
+    for (const job of store.listWorkerJobs(storeDir)) {
       if (['running', 'routing'].includes(job.status)) {
         notice(update(job.id, { status: 'uncertain', error: 'worker restarted without verified runner identity; operator resolution required' }));
       }
     }
     while (!signal?.aborted) {
-      const jobs = store.listJobs(storeDir);
+      const jobs = store.listWorkerJobs(storeDir);
       for (const job of jobs) {
         if (terminal.has(job.status)) continue;
         const parent = job.parentId && store.getJob(storeDir, job.parentId);
@@ -216,14 +247,14 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
         if (active.has(job.id) && (expired || requested)) active.get(job.id).abort();
       }
       // Decide edges before the uncertain-work safety barrier; an uncertain predecessor cannot satisfy either edge.
-      for (const job of store.listJobs(storeDir).filter(j => j.status === 'queued' && j.predecessorId)) {
+      for (const job of store.listWorkerJobs(storeDir).filter(j => j.status === 'queued' && j.predecessorId)) {
         const predecessor = store.getJob(storeDir, job.predecessorId);
         if (!terminal.has(predecessor.status) && predecessor.status !== 'uncertain') continue;
         if (!conditionMatches(job, predecessor)) notice(update(job.id, { status: 'skipped', error: `Condition ${job.condition} not satisfied by predecessor ${predecessor.id} (${predecessor.status}${predecessor.verdict ? `, verdict ${predecessor.verdict}` : ', no semantic verdict'})`, finishedAt: new Date().toISOString() }));
       }
       // Unknown mutations may still be active. Do not launch even unrelated work until resolved.
-      if (store.listJobs(storeDir).some(j => j.status === 'uncertain')) { await delay(pollMs); continue; }
-      const queued = store.listJobs(storeDir).filter(j => j.status === 'queued' && (!j.handoff || j.handoff.ready === true));
+      if (store.listWorkerJobs(storeDir).some(j => j.status === 'uncertain')) { await delay(pollMs); continue; }
+      const queued = store.listWorkerJobs(storeDir).filter(j => j.status === 'queued' && (!j.handoff || j.handoff.ready === true));
       const busyQueues = new Set([...active.keys()].map(id => store.getJob(storeDir, id).request.queue).filter(Boolean));
       for (const job of queued.reverse()) {
         if (occupiedSlots() >= concurrency) continue;
@@ -234,12 +265,15 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
           if (!terminal.has(predecessor.status)) continue;
           if (!conditionMatches(job, predecessor)) continue;
         }
-        launch(job);
-        if (job.request.queue) busyQueues.add(job.request.queue);
+        if (launch(job) && job.request.queue) busyQueues.add(job.request.queue);
       }
       await delay(pollMs);
     }
     for (const controller of active.values()) controller.abort();
     await Promise.allSettled([...promises]);
+  } catch (error) {
+    for (const controller of active.values()) controller.abort();
+    await Promise.allSettled([...promises]);
+    throw error;
   } finally { await release?.(); }
 }

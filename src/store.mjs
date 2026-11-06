@@ -15,6 +15,7 @@ const OUTPUT_LIMIT = 1_048_576;
 const QUEUE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const NAME = /^[a-z]+\.[a-z]+\.[0-9]$/;
 const ACTIVE = new Set(['queued', 'running', 'routing', 'uncertain']);
+const WORKER_STATUSES = new Set([...ACTIVE, 'succeeded', 'failed', 'cancelled', 'interrupted', 'skipped']);
 
 function queueName(name) {
   if (typeof name !== 'string' || !QUEUE.test(name) || name.includes('..')) throw new Error('invalid queue name');
@@ -229,6 +230,18 @@ export function listJobs(storeDir) {
     }).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
 }
 
+export function listWorkerJobs(storeDir) {
+  const jobs = folder(storeDir, 'jobs');
+  return readdirSync(jobs).filter(name => name.endsWith('.yaml'))
+    .map(name => {
+      const id = name.slice(0, -5);
+      if (!UUID.test(id)) throw new Error(`invalid worker job file: ${name}`);
+      const job = existingJob(storeDir, id);
+      if (!WORKER_STATUSES.has(job.status)) throw new Error(`corrupt job status: ${id}`);
+      return job;
+    }).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+}
+
 const sleep = new Int32Array(new SharedArrayBuffer(4));
 function lockedJob(storeDir, id, action) {
   const lock = location(storeDir, 'jobs', `${id}.lock`);
@@ -245,6 +258,20 @@ function lockedJob(storeDir, id, action) {
   if (fd === undefined) throw new Error(`job ${id} is locked; retry later`);
   try { return action(); }
   finally { closeSync(fd); unlinkSync(lock); }
+}
+
+export function claimQueuedJob(storeDir, id, { leaseMs = 15000, startStatus = 'running' } = {}) {
+  jobId(id);
+  if (!['running', 'routing'].includes(startStatus)) throw new Error('invalid start status');
+  return lockedJob(storeDir, id, () => {
+    const job = existingJob(storeDir, id);
+    if (job.status !== 'queued' || isCancelRequested(storeDir, id) ||
+        job.request.lifetime !== 'independent' && !ownerAlive(storeDir, job.ownerId, { leaseMs })) return null;
+    const { verdict: _verdict, ...storedJob } = job;
+    const next = { ...storedJob, status: startStatus, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
+    atomic(location(storeDir, 'jobs', `${id}.yaml`), next);
+    return next;
+  });
 }
 
 function recordVerdictUnlocked(storeDir, id, verdict) {
@@ -289,7 +316,7 @@ export function requestCancel(storeDir, id, expectedName) {
       statNoFollow(path);
     }
   };
-  return expectedName ? lockedJob(storeDir, id, action) : action();
+  return lockedJob(storeDir, jobId(id), action);
 }
 export function isCancelRequested(storeDir, id) {
   jobId(id);

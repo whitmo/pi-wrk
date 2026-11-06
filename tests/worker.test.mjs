@@ -18,6 +18,14 @@ function fixture(jobs) {
     items, cancels, notices,
     store: {
       listJobs: () => [...items.values()].reverse(),
+      listWorkerJobs: () => [...items.values()].reverse(),
+      claimQueuedJob: (_, id, { startStatus }) => {
+        const job = items.get(id);
+        if (job.status !== 'queued' || cancels.has(id)) return null;
+        const claimed = { ...job, status: startStatus, startedAt: new Date().toISOString() };
+        items.set(id, claimed);
+        return claimed;
+      },
       admitJob: (_, props) => { const job = { id: randomUUID(), status: 'queued', ...props }; items.set(job.id, job); return job; },
       getJob: (_, id) => items.get(id),
       updateJob: (_, id, patch) => { const job = { ...items.get(id), ...patch }; items.set(id, job); return job; },
@@ -90,6 +98,18 @@ test('expired queued session and unready handoff never launch', async () => {
   try {
     await until(() => f.items.get('expired').status === 'cancelled');
     assert.equal(f.items.get('handoff').status, 'queued');
+    assert.equal(launches, 0);
+  } finally { await worker.stop(); }
+});
+
+test('cancellation arriving at launch prevents runner invocation', async () => {
+  const f = fixture([{ id: 'race' }]);
+  const claim = f.store.claimQueuedJob;
+  f.store.claimQueuedJob = (...args) => { f.cancels.add('race'); return claim(...args); };
+  let launches = 0;
+  const worker = await running(f, { agent: async () => { launches++; return {}; } });
+  try {
+    await until(() => f.items.get('race').status === 'cancelled');
     assert.equal(launches, 0);
   } finally { await worker.stop(); }
 });
@@ -392,6 +412,46 @@ test('notice failure cannot overwrite successful runner outcome', async () => {
     await new Promise(resolve => setTimeout(resolve, 20));
     assert.equal(f.items.get('job').summary, 'completed');
   } finally { await worker.stop(); }
+});
+
+test('corrupt worker inventory stops recovery before launching anything', async () => {
+  const f = fixture([{ id: 'queued' }]);
+  f.store.listWorkerJobs = () => { throw new Error('corrupt running job'); };
+  let launches = 0;
+  await assert.rejects(runWorker({ storeDir: '/ignored', store: f.store, signal: AbortSignal.abort(),
+    runners: { agent: async () => { launches++; } } }), /corrupt running job/);
+  assert.equal(launches, 0);
+});
+
+test('corrupt inventory aborts and awaits an active runner before stopping the worker', async () => {
+  const f = fixture([{ id: 'running' }]);
+  let aborted = false;
+  const stop = new AbortController();
+  const work = runWorker({ storeDir: '/unused', store: f.store, pollMs: 5, signal: stop.signal,
+    runners: { agent: async (_, { signal }) => {
+      await new Promise(resolve => signal.addEventListener('abort', () => { aborted = true; resolve(); }, { once: true }));
+    } } });
+  try {
+    await until(() => f.items.get('running').status === 'running');
+    f.store.listWorkerJobs = () => { throw new Error('corrupt running job'); };
+    await assert.rejects(work, /corrupt running job/);
+    assert.equal(aborted, true);
+    assert.equal(f.items.get('running').status, 'cancelled');
+  } finally { stop.abort(); await work.catch(() => {}); }
+});
+
+test('unresponsive live worker lock cannot be replaced or stolen', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'wrk-live-lock-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const lock = join(dir, 'worker.lock');
+  writeFileSync(lock, `pid: ${process.pid}\ntoken: blocked-socket\nprotocolVersion: 2\n`);
+  const old = new Date(Date.now() - 20000);
+  utimesSync(lock, old, old);
+  let launches = 0;
+  await assert.rejects(ensureWorker(dir, { timeoutMs: 200, spawnWorker: () => { launches++; throw new Error('spawned duplicate'); } }), /unresponsive|alive|owner/i);
+  assert.equal(launches, 0);
+  await assert.rejects(runWorker({ storeDir: dir, signal: AbortSignal.abort() }), /already running|unresponsive|alive|owner/i);
+  assert.equal(existsSync(lock), true);
 });
 
 test('detached worker waits out a recent unverifiable lock and becomes ready', async () => {
