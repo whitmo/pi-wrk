@@ -5,7 +5,8 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { captureFocus } from '../src/focus.mjs';
 import { parseInput } from '../src/input-syntax.mjs';
 import { generateName, loadNameWords } from '../src/names.mjs';
-import { readTab } from '../src/zellij-watch.mjs';
+import { readTab, readTabScreen } from '../src/zellij-watch.mjs';
+import { createTabRegistry } from './at7-tabs.ts';
 
 type Request = {
   runner: string;
@@ -71,6 +72,7 @@ type Dependencies = {
   zellijSessionName(): string | undefined;
   zellijPaneId(): number | undefined;
   readZellijTab(sessionName: string, selector: { tabName?: string; tabId?: number; ownPaneId?: number }): Promise<{ tabId: number; snapshot: string }>;
+  readZellijScreen?(sessionName: string, selector: { tabName?: string; tabId?: number; ownPaneId?: number }): Promise<{ tabId: number; snapshot: string }>; 
 };
 
 function projectRoot(cwd: string): string {
@@ -109,6 +111,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   const btwJobs = new Map<string, (result: BtwResult) => void>();
   let watch: { sessionId: string; sessionName: string; tabName: string; tabId: number; snapshot?: string; changed: boolean; checking: boolean; timer?: ReturnType<typeof setInterval> } | undefined;
   let watchGeneration = 0;
+  const tabs = createTabRegistry(deps.readZellijScreen ?? deps.readZellijTab, deps.zellijPaneId);
 
   function stopWatch() {
     watchGeneration++;
@@ -267,6 +270,12 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     const [verb, id, extra] = args.trim().split(/\s+/);
     const dir = session.dir;
     try {
+      if (verb === 'at7' && id === 'tab') {
+        if (!extra) throw new Error('Usage: /wrk at7 tab <name>');
+        tabs.visited(args.trim().slice('at7 tab'.length).trim());
+        notify(ctx, `Registered @@7 tab ${args.trim().slice('at7 tab'.length).trim()} for next-turn intake`);
+        return;
+      }
       if (verb === 'queues') {
         if (id) throw new Error('Usage: /wrk queues');
         const queues = deps.listQueues?.(dir);
@@ -350,6 +359,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
 
   pi.on('session_start', (_event, ctx) => {
     stopWatch();
+    tabs.clear();
     for (const done of btwJobs.values()) done({ error: 'Owning Pi session changed before BTW replied' });
     if (active) { deps.clearInterval(active.timer); deps.closeOwner(active.dir, active.ownerId); active = undefined; }
     if (pending) block('Session changed before the foreground settled');
@@ -386,6 +396,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   pi.on('session_shutdown', (_event, ctx) => {
     if (active?.sessionId !== ctx.sessionManager.getSessionId()) return;
     stopWatch();
+    tabs.clear();
     for (const done of btwJobs.values()) done({ error: 'Owning Pi session closed before BTW replied' });
     if (active) { deps.clearInterval(active.timer); deps.closeOwner(active.dir, active.ownerId); active = undefined; }
     if (pending) block('Session closed before the foreground settled');
@@ -395,7 +406,16 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   pi.on('before_agent_start', (event, ctx) => {
     turn = { sessionId: ctx.sessionManager.getSessionId(), prompt: event.prompt, toolSeen: false };
   });
-  pi.on('tool_call', () => { if (turn) turn.toolSeen = true; if (pending) pending.toolSeen = true; });
+  pi.on('tool_call', (event) => {
+    if (turn) turn.toolSeen = true;
+    if (pending) pending.toolSeen = true;
+    const call = event as { toolName?: string; input?: { command?: string } };
+    if (call.toolName !== 'bash' || !call.input?.command) return;
+    const created = /(?:^|[;&|]\s*)zellij\s+action\s+new-tab\s+--name\s+([\w.-]+)/.exec(call.input.command);
+    const visited = /(?:^|[;&|]\s*)zellij\s+action\s+go-to-tab-name\s+([\w.-]+)/.exec(call.input.command);
+    if (created) tabs.created(created[1]);
+    if (visited) tabs.visited(visited[1]);
+  });
   pi.on('agent_before_settle', (event) => {
     if (turn) turn.outcome = event.outcome;
     if (pending) pending.outcome = event.outcome;
@@ -438,5 +458,6 @@ export default async function extension(pi: ExtensionAPI): Promise<void> {
       return id && /^(?:terminal_)?\d+$/.test(id) ? Number(id.replace('terminal_', '')) : undefined;
     },
     readZellijTab: readTab,
+    readZellijScreen: readTabScreen,
   });
 }

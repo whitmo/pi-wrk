@@ -5,7 +5,16 @@ import { promisify } from 'node:util';
 const execute = promisify(execFile);
 
 /** Read one tab without focusing it; a screen snapshot is not a raw output stream. */
-export async function readTab(sessionName, { tabName, tabId, ownPaneId }, run = execute) {
+export async function readTab(sessionName, selection, run = execute) {
+  return captureTab(sessionName, selection, run, false);
+}
+
+/** Read visible terminal text for @@7 intake without changing the watch snapshot contract. */
+export async function readTabScreen(sessionName, selection, run = execute) {
+  return captureTab(sessionName, selection, run, true);
+}
+
+async function captureTab(sessionName, { tabName, tabId, ownPaneId }, run, raw) {
   if (!sessionName) throw new Error('Zellij session unavailable (ZELLIJ_SESSION_NAME is not set)');
   const action = async (args) => {
     const { stdout } = await run('zellij', ['--session', sessionName, 'action', ...args], {
@@ -27,7 +36,7 @@ export async function readTab(sessionName, { tabName, tabId, ownPaneId }, run = 
   const snapshots = [];
   for (const pane of terminals) {
     const screen = await action(['dump-screen', '--pane-id', `terminal_${pane.id}`]);
-    snapshots.push([pane.id, createHash('sha256').update(screen).digest('hex')]);
+    snapshots.push([pane.id, raw ? screen : createHash('sha256').update(screen).digest('hex')]);
   }
-  return { tabId: id, snapshot: JSON.stringify(snapshots) };
+  return { tabId: id, snapshot: raw ? snapshots.map(([, screen]) => screen).join('\n') : JSON.stringify(snapshots) };
 }
