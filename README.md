@@ -59,6 +59,14 @@ For bounded check/fix loops and safe deploy ordering, see the `and-do`,
 `or-do` and `until-true` skills. Only one predecessor is tracked; these
 commands do not implement automatic loops.
 
+In interactive composer input, a leading `&`, `&&`, `||`, `~&&`, or
+`~||` works without `/`. A trailing ` &` sends that line to pi-wrk;
+other lines stay in the foreground. Use
+`<& type=swarm model="provider/model"> task </&>` to mark a specific
+span; `type` also accepts `bg`, `agent`, `council`, or `todo`. Only one
+background form is accepted per input. Bare `&` requests the same
+conservative foreground handoff as bare `/&`.
+
 Worker-owned agents have a `wrk_message` tool for questions, blockers and
 results. The submitting session displays durable notices on its heartbeat,
 without injecting a foreground prompt or model turn. Notices remain on disk
