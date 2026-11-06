@@ -10,7 +10,7 @@ import { normalizeFocus } from './focus.mjs';
 
 const UUID = /^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i;
 const OWNER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const IMMUTABLE = new Set(['id', 'name', 'request', 'ownerId', 'projectRoot', 'cwd', 'createdAt', 'parentId', 'lifetime', 'queue', 'focus', 'predecessorId', 'condition']);
+const IMMUTABLE = new Set(['id', 'name', 'request', 'ownerId', 'projectRoot', 'cwd', 'createdAt', 'admittedAtNs', 'parentId', 'lifetime', 'queue', 'focus', 'predecessorId', 'condition']);
 const OUTPUT_LIMIT = 1_048_576;
 const QUEUE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 const NAME = /^[a-z]+\.[a-z]+\.[0-9]$/;
@@ -126,6 +126,7 @@ function existingJob(storeDir, id) {
       !UUID.test(job.id) || !OWNER.test(job.ownerId ?? '') ||
       !isAbsolute(job.projectRoot ?? '') || !isAbsolute(job.cwd ?? '') ||
       typeof job.status !== 'string' || typeof job.createdAt !== 'string' ||
+      (job.admittedAtNs !== undefined && (typeof job.admittedAtNs !== 'string' || !/^\d+$/.test(job.admittedAtNs))) ||
       typeof job.updatedAt !== 'string' || !job.request || typeof job.request !== 'object' ||
       (job.name != null && !NAME.test(job.name)) ||
       (job.parentId != null && !UUID.test(job.parentId)) ||
@@ -186,7 +187,7 @@ export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, 
   for (let attempt = 0; attempt < 5; attempt++) {
     const id = randomUUID();
     const job = { id, request, ownerId: owner, projectRoot: resolve(projectRoot), cwd: resolve(cwd),
-      status: 'queued', createdAt: now, updatedAt: now };
+      status: 'queued', createdAt: now, admittedAtNs: process.hrtime.bigint().toString(), updatedAt: now };
     if (name !== undefined) job.name = name;
     if (focus !== undefined) job.focus = focus;
     if (handoff !== undefined) job.handoff = handoff;
@@ -221,13 +222,25 @@ export function resolveJobId(storeDir, reference) {
   return job.id;
 }
 
+function newestFirst(a, b) {
+  const byDate = b.createdAt.localeCompare(a.createdAt);
+  if (byDate) return byDate;
+  // Legacy jobs predate admission timestamps, so they precede new jobs on a tie.
+  if (Boolean(a.admittedAtNs) !== Boolean(b.admittedAtNs)) return a.admittedAtNs ? -1 : 1;
+  if (a.admittedAtNs && b.admittedAtNs) {
+    const first = BigInt(a.admittedAtNs), second = BigInt(b.admittedAtNs);
+    if (first !== second) return first > second ? -1 : 1;
+  }
+  return b.id.localeCompare(a.id);
+}
+
 export function listJobs(storeDir) {
   const jobs = folder(storeDir, 'jobs');
   return readdirSync(jobs).filter(name => UUID.test(name.slice(0, -5)) && name.endsWith('.yaml'))
     .flatMap(name => {
       try { return [existingJob(storeDir, name.slice(0, -5))]; }
       catch { return []; } // One corrupt entry must not hide otherwise healthy jobs.
-    }).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    }).sort(newestFirst);
 }
 
 export function listWorkerJobs(storeDir) {

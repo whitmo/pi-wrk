@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { parse } from 'yaml';
+import { parse, stringify } from 'yaml';
 import { spawn } from 'node:child_process';
 import {
   storePath, admitJob, listJobs, listWorkerJobs, getJob, updateJob, requestCancel, claimQueuedJob,
@@ -35,6 +35,24 @@ test('admission persists YAML with private permissions and exclusive UUID identi
   assert.equal(statSync(join(dir, 'jobs', `${a.id}.yaml`)).mode & 0o777, 0o600);
   assert.equal(parse(readFileSync(join(dir, 'jobs', `${a.id}.yaml`), 'utf8')).id, a.id);
   assert.equal(readdirSync(join(dir, 'jobs')).length, 2);
+});
+
+test('equal-millisecond queued jobs retain admission order, not UUID order', t => {
+  const { dir, input } = fixture(t);
+  const jobs = [admitJob(dir, input), admitJob(dir, input), admitJob(dir, input)];
+  assert.ok(BigInt(jobs[0].admittedAtNs) < BigInt(jobs[1].admittedAtNs));
+  assert.ok(BigInt(jobs[1].admittedAtNs) < BigInt(jobs[2].admittedAtNs));
+  const [legacy, first, second] = jobs.sort((a, b) => b.id.localeCompare(a.id));
+  for (const [job, order] of [[first, '1'], [second, '2']]) {
+    const path = join(dir, 'jobs', `${job.id}.yaml`);
+    writeFileSync(path, stringify({ ...parse(readFileSync(path, 'utf8')),
+      createdAt: '2026-01-01T00:00:00.000Z', admittedAtNs: order }));
+  }
+  const oldPath = join(dir, 'jobs', `${legacy.id}.yaml`);
+  const oldRecord = parse(readFileSync(oldPath, 'utf8'));
+  delete oldRecord.admittedAtNs;
+  writeFileSync(oldPath, stringify({ ...oldRecord, createdAt: '2026-01-01T00:00:00.000Z' }));
+  assert.deepEqual(listJobs(dir).reverse().map(job => job.id), [legacy.id, first.id, second.id]);
 });
 
 test('queue definitions survive jobs and reject path-like queue names', t => {

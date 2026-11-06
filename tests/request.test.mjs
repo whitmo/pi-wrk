@@ -27,6 +27,17 @@ test('routing selectors and leading lifetime flag select distinct jobs', () => {
   assert.deepEqual(parseRequest('fix', { alias: 'wrk' }), expected('router', 'fix'));
 });
 
+test('extra whitespace between control prefixes does not turn selectors into prompt text', () => {
+  assert.deepEqual(parseRequest('--lifetime independent   q:{name: review}   a:{name: ari} investigate'),
+    expected('agent', 'investigate', { name: 'ari' }, 'review', 'independent'));
+  assert.deepEqual(parseRequest('q:{name: review}   council assess'),
+    expected('council', 'assess', {}, 'review'));
+  assert.deepEqual(parseRequest('--lifetime independent   plain text'),
+    expected('router', '  plain text', {}, null, 'independent'));
+  assert.deepEqual(parseRequest('q:{name: review}   --focus active inspect'),
+    expected('router', '  --focus active inspect', {}, 'review'));
+});
+
 test('explicit agent selection keeps keyword-prefixed prompt opaque for bg', () => {
   assert.deepEqual(parseRequest('a:{name: ari} council assess', { alias: 'bg' }),
     expected('agent', 'council assess', { name: 'ari' }));

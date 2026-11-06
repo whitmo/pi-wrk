@@ -7,6 +7,17 @@ function removeSeparator(text) {
   return /^\s/.test(text) ? text.slice(1) : text;
 }
 
+function trimNextControl(text, allowFlags = false) {
+  const next = text.trimStart();
+  const selectorOrRunner = /^(?:[A-Za-z][\w-]*:\{|(?:bg|swarm|council|todo)(?=\s|$))/.test(next);
+  const flag = allowFlags && /^--(?:lifetime|focus)(?=\s|$)/.test(next);
+  return next !== text && (selectorOrRunner || flag) ? next : text;
+}
+
+function removeControlSeparator(text) {
+  return trimNextControl(removeSeparator(text), true);
+}
+
 function consumeMap(text, type) {
   const start = type.length + 1;
   if (text[start] !== '{') throw new Error(`invalid ${type} selector`);
@@ -58,7 +69,7 @@ export function parseRequest(text, { alias = '&' } = {}) {
     if (flags[flag] || !(flag === 'focus' ? ['context', 'active', 'none'] : ['session', 'independent']).includes(value))
       throw new Error(`invalid or duplicate ${flag}`);
     flags[flag] = value;
-    source = removeSeparator(source.slice(match[0].length));
+    source = removeControlSeparator(source.slice(match[0].length));
   }
   lifetime = flags.lifetime ?? lifetime;
   const focus = flags.focus ? { focusMode: flags.focus } : {};
@@ -71,6 +82,7 @@ export function parseRequest(text, { alias = '&' } = {}) {
     throw new Error('unknown selector');
   if (source.startsWith('q:')) {
     [options, source] = consumeMap(source, 'q');
+    source = trimNextControl(source);
     queue = options.name;
     options = {};
     if (/^[A-Za-z][\w-]*:\{/.test(source) && !/^(?:a|sh):\{/.test(source))
