@@ -25,7 +25,8 @@ export function createAt7Workspace(projectRoot, workingDirectory) {
   const path = join(root, '.agents', 'worktrees', branch.replace('/', '-'));
   mkdirSync(dirname(path), { recursive: true });
   git(root, ['worktree', 'add', '-b', branch, path, 'HEAD']);
-  return { projectRoot: path, cwd: join(path, inside), branch };
+  const target = join(path, inside);
+  return { projectRoot: path, cwd: existsSync(target) ? target : path, branch };
 }
 
 export function createSwarmWorkspaces(job) {

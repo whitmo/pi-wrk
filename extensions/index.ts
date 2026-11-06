@@ -129,7 +129,11 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       const fileMessages = await (deps.collectFileMessages ?? collectFileMessages)(root, scope, seen);
       if (current(ctx) !== session) return;
       const zellij = deps.zellijSessionName();
-      const tabMessages = zellij && deps.zellijPaneId() !== undefined ? await tabs.scan(zellij, seen) : [];
+      let tabMessages: At7Message[] = [];
+      if (zellij && deps.zellijPaneId() !== undefined) {
+        try { tabMessages = await tabs.scan(zellij, seen); }
+        catch (error) { notify(ctx, `@@7 tab intake failed: ${error instanceof Error ? error.message : String(error)}`, 'warning'); }
+      }
       if (current(ctx) !== session) return;
       for (const item of [...fileMessages, ...tabMessages]) {
         if (seen.has(item.key)) continue;
@@ -312,8 +316,13 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       }
       if (verb === 'at7' && id === 'tab') {
         if (!extra) throw new Error('Usage: /wrk at7 tab <name>');
-        tabs.visited(args.trim().slice('at7 tab'.length).trim());
-        notify(ctx, `Registered @@7 tab ${args.trim().slice('at7 tab'.length).trim()} for next-turn intake`);
+        const name = args.trim().slice('at7 tab'.length).trim();
+        const zellij = deps.zellijSessionName();
+        if (!zellij || deps.zellijPaneId() === undefined) throw new Error('Zellij session and Pi pane are required for @@7 tab intake');
+        tabs.visited(name);
+        await tabs.baseline(zellij, name);
+        if (current(ctx) !== session) return;
+        notify(ctx, `Registered @@7 tab ${name} for next-turn intake`);
         return;
       }
       if (verb === 'queues') {
@@ -463,9 +472,17 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     const call = event as { toolName?: string; input?: { command?: string } };
     if (call.toolName !== 'bash' || !call.input?.command) return;
     const created = /(?:^|[;&|]\s*)zellij\s+action\s+new-tab\s+--name\s+([\w.-]+)/.exec(call.input.command);
-    const visited = /(?:^|[;&|]\s*)zellij\s+action\s+go-to-tab-name\s+([\w.-]+)/.exec(call.input.command);
     if (created) tabs.created(created[1]);
-    if (visited) tabs.visited(visited[1]);
+  });
+  pi.on('tool_result', async (event, ctx) => {
+    const call = event as { toolName?: string; input?: { command?: string }; isError?: boolean };
+    if (call.toolName !== 'bash' || call.isError || !call.input?.command || !current(ctx)) return;
+    const visited = /(?:^|[;&|]\s*)zellij\s+action\s+go-to-tab-name\s+([\w.-]+)/.exec(call.input.command);
+    const zellij = deps.zellijSessionName();
+    if (!visited || !zellij || deps.zellijPaneId() === undefined) return;
+    tabs.visited(visited[1]);
+    try { await tabs.baseline(zellij, visited[1]); }
+    catch (error) { notify(ctx, `@@7 tab baseline failed: ${error instanceof Error ? error.message : String(error)}`, 'warning'); }
   });
   pi.on('agent_before_settle', (event) => {
     if (turn) turn.outcome = event.outcome;

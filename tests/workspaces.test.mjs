@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -37,6 +37,15 @@ test('@@7 triage gets its own worktree while the owner retains dirty files', t =
   commit(space, 'triage.txt', 'independent\n');
   assert.equal(readFileSync(join(root, 'base.txt'), 'utf8'), 'dirty owner\n');
   assert.equal(git(root, 'branch', '--show-current'), 'main');
+});
+
+test('@@7 triage remains runnable when the owner works in an untracked subdirectory', t => {
+  const root = repo(t);
+  const subdir = join(root, 'new-dir');
+  mkdirSync(subdir);
+  writeFileSync(join(subdir, 'message.txt'), '# @@7 ask');
+  const space = createAt7Workspace(root, subdir);
+  assert.equal(space.cwd, space.projectRoot);
 });
 
 test('independent child commits combine in retained integration branch without changing original checkout', t => {
