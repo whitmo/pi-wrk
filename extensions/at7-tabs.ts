@@ -10,6 +10,16 @@ export function createTabRegistry(read: Reader, ownPaneId?: () => number | undef
   return {
     created(tabName: string) { tabs.set(tabName, { created: true }); },
     visited(tabName: string) { tabs.set(tabName, { created: false }); },
+    async baseline(sessionName: string, tabName: string) {
+      const tab = tabs.get(tabName);
+      if (!tab || tab.created) return;
+      const current = generation;
+      const { tabId, snapshot } = await read(sessionName, { tabName, tabId: undefined, ownPaneId: ownPaneId?.() });
+      if (generation !== current || tabs.get(tabName) !== tab) return;
+      session = sessionName;
+      tab.tabId = tabId;
+      tab.snapshot = snapshot;
+    },
     clear() { tabs.clear(); session = undefined; generation++; },
     async scan(sessionName: string, seen: ReadonlySet<string>): Promise<At7Message[]> {
       if (session && session !== sessionName) { tabs.clear(); generation++; }

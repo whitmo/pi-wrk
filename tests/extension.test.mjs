@@ -168,6 +168,40 @@ test('triage notice displays bounded success or failure in transcript without wa
   assert.equal(reload.transcript.length, 1);
 });
 
+test('explicit visit baselines immediately, so output arriving before next turn is delivered', async () => {
+  let screen = '@@7 old';
+  const h = harness({ readZellijTab: async () => ({ tabId: 9, snapshot: screen }) });
+  await h.event('session_start');
+  await h.command('wrk', 'at7 tab my-tab');
+  screen += '\n@@7 after visit';
+  await h.event('before_agent_start', { prompt: 'continue' });
+  assert.equal(h.jobs.size, 1);
+  assert.match([...h.jobs.values()][0].request.prompt, /after visit/);
+});
+
+test('Pi-mediated tab visit baselines at completed tool call', async () => {
+  let screen = '@@7 old';
+  const h = harness({ readZellijTab: async () => ({ tabId: 9, snapshot: screen }) });
+  await h.event('session_start');
+  await h.event('tool_call', { toolName: 'bash', input: { command: 'zellij action go-to-tab-name visited' } });
+  await h.event('tool_result', { toolName: 'bash', input: { command: 'zellij action go-to-tab-name visited' }, isError: false });
+  screen += '\n@@7 next';
+  await h.event('before_agent_start', { prompt: 'continue' });
+  assert.equal(h.jobs.size, 1);
+  assert.match([...h.jobs.values()][0].request.prompt, /next/);
+});
+
+test('file messages still admit when a registered tab fails to read', async () => {
+  const item = { key: 'file:question', source: 'file', location: 'a:1', text: 'answer me' };
+  const h = harness({ collectFileMessages: async () => [item], readZellijTab: async () => { throw new Error('tab closed'); } });
+  await h.event('session_start');
+  await h.event('tool_call', { toolName: 'bash', input: { command: 'zellij action new-tab --name closed' } });
+  await h.event('before_agent_start', { prompt: 'continue' });
+  assert.equal(h.jobs.size, 1);
+  assert.match([...h.jobs.values()][0].request.prompt, /answer me/);
+  assert.equal(h.ui.some(entry => /tab closed/.test(entry.message ?? '')), true);
+});
+
 test('explicit at7 tab registration does not start a watch or wake an idle session', async () => {
   const h = harness({ readZellijTab: async () => ({ tabId: 9, snapshot: '@@7 old' }) });
   await h.event('session_start');
