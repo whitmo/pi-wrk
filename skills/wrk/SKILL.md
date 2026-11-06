@@ -19,6 +19,7 @@ the foreground agent plan or execute the submitted prompt.
 | `/& council <prompt>` | Two independent read-only assessments, then synthesis |
 | `/& swarm <prompt>` | Two child assignments, then synthesis |
 | `/& todo` | Requires a configured shared todo-provider adapter; currently unavailable by default |
+| `/wrk btw <question>` | Ask the existing BTW side thread without leaving this session; requires pi-btw |
 | `/wrk` or `/wrk jobs` | List current project's jobs |
 | `/wrk status <id>` / `/wrk output <id>` | Inspect state, notices or bounded output |
 | `/wrk cancel <id>` | Request cancellation; check status for the final outcome |
@@ -27,5 +28,8 @@ A leading `--lifetime independent` keeps a job alive after the submitting
 session closes; the default `session` lifetime uses a heartbeat lease,
 even for jobs in a named queue. The project store is `.agents/wrk/` and
 is local private runtime data, not Git state. Reconnect via `/wrk` in the
-same project. Bare `/&` and `/bg` hand off only a provably unfinished
+same project. Inspect a BTW result with `/wrk status <id>` or
+`/wrk output <id>`; open `/btw` to follow up in its retained side thread.
+BTW jobs require the submitting session and cannot run independently.
+Bare `/&` and `/bg` hand off only a provably unfinished
 foreground request; see `bg` for the duplicate-mutation limit.
