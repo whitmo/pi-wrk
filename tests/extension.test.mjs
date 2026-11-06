@@ -88,6 +88,25 @@ test('BTW submission stays in the current session and publishes an inspectable a
   assert.match(h.ui.at(-1).message, /succeeded/);
 });
 
+test('BTW answer remains readable from the durable job store', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-btw-ui-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = store.storePath(root);
+  const h = harness({ realStore: dir });
+  h.event('session_start');
+  h.onBus('pi-wrk:btw-submit', ({ accept, done }) => {
+    accept();
+    done({ answer: 'Durable answer' });
+  });
+  await h.command('wrk', 'btw explain this deployment');
+  await flush();
+  const [job] = store.listJobs(dir);
+  assert.equal(job.status, 'succeeded');
+  assert.match(store.readJobOutput(dir, job.id), /Durable answer/);
+  await h.command('wrk', `output ${job.id}`);
+  assert.match(h.ui.at(-1).message, /Durable answer/);
+});
+
 test('BTW submission fails visibly if BTW is missing or the query fails', async () => {
   const h = harness();
   h.event('session_start');
