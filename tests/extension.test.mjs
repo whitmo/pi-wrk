@@ -8,7 +8,7 @@ import * as store from '../src/store.mjs';
 
 const { createExtension } = await createJiti(import.meta.url).import('../extensions/index.ts');
 
-function harness({ startup = () => Promise.resolve(), parser, realStore } = {}) {
+function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure } = {}) {
   const commands = new Map();
   const events = new Map();
   const bus = new Map();
@@ -44,7 +44,10 @@ function harness({ startup = () => Promise.resolve(), parser, realStore } = {}) 
     updateJob: (_, id, patch) => Object.assign(jobs.get(id), patch),
     requestCancel: (_, id) => { if (!jobs.has(id)) throw new Error('unknown job'); jobs.get(id).cancelRequested = true; },
     readJobOutput: (_, id) => output.get(id) ?? `output ${id}`,
-    appendJobOutput: (_, id, text) => output.set(id, `${output.get(id) ?? ''}${text}`),
+    appendJobOutput: (_, id, text) => {
+      if (outputFailure) throw new Error(outputFailure);
+      output.set(id, `${output.get(id) ?? ''}${text}`);
+    },
     readNotices: () => notices,
     writeNotice: (_, notice) => notices.push(notice),
     touchOwner: (_, id) => ui.push({ touched: id }),
@@ -73,7 +76,7 @@ test('BTW submission stays in the current session and publishes an inspectable a
   await h.command('wrk', 'btw explain this deployment');
   assert.equal(request.question, 'explain this deployment');
   assert.equal(request.ctx, h.ctx);
-  assert.equal(h.starts, 0, 'a local BTW job must not start the external worker');
+  assert.equal(h.starts, 1, 'worker must reconcile this job if the Pi session crashes');
   assert.equal(h.aborted, 0);
   assert.equal(h.jobs.size, 1);
   const job = [...h.jobs.values()][0];
@@ -121,6 +124,27 @@ test('BTW submission fails visibly if BTW is missing or the query fails', async 
   assert.match(failed.error, /No credentials/);
   await h.command('wrk', `status ${failed.id}`);
   assert.match(h.ui.at(-1).message, /No credentials/);
+});
+
+test('BTW output-write failure marks the job failed instead of leaving it running', async () => {
+  const h = harness({ outputFailure: 'disk full' });
+  h.event('session_start');
+  h.onBus('pi-wrk:btw-submit', ({ accept, done }) => {
+    accept();
+    done({ answer: 'reply' });
+  });
+  await h.command('wrk', 'btw question');
+  const [job] = [...h.jobs.values()];
+  assert.equal(job.status, 'failed');
+  assert.match(job.error, /disk full/);
+});
+
+test('a new session starts reconciliation for an abandoned BTW job', async () => {
+  const h = harness();
+  h.jobs.set('old-job', { id: 'old-job', status: 'running', request: { runner: 'btw' } });
+  h.event('session_start');
+  await flush();
+  assert.equal(h.starts, 1);
 });
 
 test('BTW running job is failed if its owning session closes', async () => {

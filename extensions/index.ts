@@ -130,13 +130,20 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
           if (!error) deps.appendJobOutput(dir, job.id, result.answer!);
           const status = error ? 'failed' : 'succeeded';
           deps.updateJob(dir, job.id, { status, ...(error ? { error } : {}), finishedAt: new Date().toISOString() });
-          deps.writeNotice?.(dir, { ownerId: session.ownerId, jobId: job.id,
-            message: `${job.id}: ${status}${error ? ` — ${error}` : ''}`, kind: status });
         } catch (failure) {
-          notify(ctx, `BTW ${job.id}: ${failure instanceof Error ? failure.message : String(failure)}`, 'error');
+          const error = `BTW result could not be saved: ${failure instanceof Error ? failure.message : String(failure)}`;
+          try { deps.updateJob(dir, job.id, { status: 'failed', error, finishedAt: new Date().toISOString() }); }
+          catch { /* store may be unavailable; notify the live session */ }
+          notify(ctx, `${job.id}: ${error}`, 'error');
         }
+        try {
+          const latest = deps.getJob(dir, job.id);
+          deps.writeNotice?.(dir, { ownerId: session.ownerId, jobId: job.id,
+            message: `${job.id}: ${latest.status}${latest.error ? ` — ${latest.error}` : ''}`, kind: latest.status });
+        } catch { /* the durable job status remains inspectable */ }
       };
       btwJobs.set(job.id, done);
+      start(dir, job, ctx, session.sessionId, session.ownerId);
       let accepted = false;
       try {
         pi.events.emit('pi-wrk:btw-submit', {
@@ -255,6 +262,12 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     }, 5000);
     timer.unref?.();
     active = { sessionId: ctx.sessionManager.getSessionId(), ownerId, dir, timer };
+    // A previous Pi may have exited without shutdown; restart the worker to
+    // reconcile its session-owned jobs even when this session submits no work.
+    try {
+      const stale = deps.listJobs(dir).find((job: Job) => job.request?.runner === 'btw' && job.status === 'running');
+      if (stale) start(dir, stale, ctx, active.sessionId, ownerId);
+    } catch (error) { notify(ctx, `Could not inspect BTW jobs: ${error instanceof Error ? error.message : String(error)}`, 'error'); }
     turn = undefined;
     pending = undefined;
     ctx.ui.setStatus('wrk', undefined);
