@@ -466,22 +466,26 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     turn = { sessionId: ctx.sessionManager.getSessionId(), prompt: event.prompt, toolSeen: false };
     await scanAt7(ctx, 'changed');
   });
+  function namedTab(command: string, action: 'new-tab' | 'go-to-tab-name') {
+    const match = new RegExp(`(?:^|[;&|]\\s*)zellij\\s+(?:--session\\s+([\\w.-]+)\\s+)?action\\s+${action}\\s+${action === 'new-tab' ? '--name\\s+' : ''}([\\w.-]+)`).exec(command);
+    return match && (!match[1] || match[1] === deps.zellijSessionName()) ? match[2] : undefined;
+  }
   pi.on('tool_call', (event) => {
     if (turn) turn.toolSeen = true;
     if (pending) pending.toolSeen = true;
     const call = event as { toolName?: string; input?: { command?: string } };
     if (call.toolName !== 'bash' || !call.input?.command) return;
-    const created = /(?:^|[;&|]\s*)zellij\s+action\s+new-tab\s+--name\s+([\w.-]+)/.exec(call.input.command);
-    if (created) tabs.created(created[1]);
+    const created = namedTab(call.input.command, 'new-tab');
+    if (created) tabs.created(created);
   });
   pi.on('tool_result', async (event, ctx) => {
     const call = event as { toolName?: string; input?: { command?: string }; isError?: boolean };
     if (call.toolName !== 'bash' || call.isError || !call.input?.command || !current(ctx)) return;
-    const visited = /(?:^|[;&|]\s*)zellij\s+action\s+go-to-tab-name\s+([\w.-]+)/.exec(call.input.command);
+    const visited = namedTab(call.input.command, 'go-to-tab-name');
     const zellij = deps.zellijSessionName();
     if (!visited || !zellij || deps.zellijPaneId() === undefined) return;
-    tabs.visited(visited[1]);
-    try { await tabs.baseline(zellij, visited[1]); }
+    tabs.visited(visited);
+    try { await tabs.baseline(zellij, visited); }
     catch (error) { notify(ctx, `@@7 tab baseline failed: ${error instanceof Error ? error.message : String(error)}`, 'warning'); }
   });
   pi.on('agent_before_settle', (event) => {
