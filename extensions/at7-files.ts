@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
@@ -20,6 +20,7 @@ export async function collectFileMessages(root: string, scope: 'changed' | 'all'
   const found: At7Message[] = [];
   for (const path of paths) {
     try {
+      if (!(await lstat(join(root, path))).isFile()) continue;
       const bytes = await readFile(join(root, path));
       if (bytes.includes(0)) continue;
       const lines = bytes.toString('utf8').split('\n');
