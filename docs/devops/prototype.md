@@ -95,6 +95,19 @@ set an attempt limit, rerun the predicate after each fix, and attach any
 deploy job to the *latest passing predicate*, not to the fix. Uncertain
 work blocks all new starts until an operator has inspected survivors.
 
+## Session-bound Zellij watch
+
+`/watch:zellij <tab name>` watches terminal panes in the exact named tab
+of the invoking Pi agent's Zellij session. It needs
+`ZELLIJ_SESSION_NAME` and `ZELLIJ_PANE_ID`; it rejects the agent's own
+tab and never changes tab or pane focus. A later viewport change wakes
+that agent once, including one before the first poll. Output hidden
+between polls may not wake it; user-typed changes can.
+Starting another watch replaces it; switching or closing the Pi session
+stops it. It is not a durable pi-wrk job. Process, PR, periodic command
+and interactive-session sources remain deferred. A read-only live CLI
+snapshot succeeded; live Pi follow-up delivery still needs proof.
+
 ## What still needs proof or a decision
 
 - Authenticated Pi agent/model execution. The installed CLI was reached,

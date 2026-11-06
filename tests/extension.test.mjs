@@ -8,7 +8,7 @@ import * as store from '../src/store.mjs';
 
 const { createExtension } = await createJiti(import.meta.url).import('../extensions/index.ts');
 
-function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure } = {}) {
+function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure, readZellijTab, zellijSessionName, zellijPaneId } = {}) {
   const commands = new Map();
   const events = new Map();
   const bus = new Map();
@@ -22,6 +22,8 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
   let aborted = 0;
   let starts = 0;
   let heartbeat;
+  let watchTick;
+  const messages = [];
   const branch = [{ id: 'prompt-1', type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'Unfinished request' }] } }];
   const ctx = {
     cwd: '/project', mode: 'tui', hasUI: true,
@@ -54,20 +56,122 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
     closeOwner: (_, id) => ui.push({ closed: id }),
     ensureWorker: () => { starts++; return startup(); },
     projectRoot: () => '/project',
-    setInterval: (callback) => { heartbeat = callback; return { unref() {} }; },
-    clearInterval: () => {},
+    setInterval: (callback, ms) => {
+      const timer = { cleared: false, unref() {} };
+      const tick = () => { if (!timer.cleared) callback(); };
+      if (ms === 5000) heartbeat = tick;
+      if (ms === 1000) watchTick = tick;
+      return timer;
+    },
+    clearInterval: (timer) => { timer.cleared = true; },
     newOwnerId: () => `owner-${owner}`,
+    readZellijTab: readZellijTab ?? (async () => { throw new Error('No Zellij test fixture'); }),
+    zellijSessionName: zellijSessionName ?? (() => 'agent-zellij'),
+    zellijPaneId: zellijPaneId ?? (() => 42),
   };
   if (realStore) Object.assign(deps, store, { storePath: () => realStore });
-  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), on: (name, handler) => events.set(name, handler), events: { emit: (name, payload) => bus.get(name)?.(payload) } };
+  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), on: (name, handler) => events.set(name, handler), events: { emit: (name, payload) => bus.get(name)?.(payload) }, sendUserMessage: (message, options) => messages.push({ message, options }) };
   createExtension(pi, deps);
   const command = (name, input = '') => commands.get(name)(input, ctx);
   const event = (name, payload = {}, context = ctx) => events.get(name)?.(payload, context);
-  return { command, event, onBus: (name, handler) => bus.set(name, handler), ctx, jobs, ui, branch, notices, tick: () => heartbeat?.(), get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
+  return { command, event, onBus: (name, handler) => bus.set(name, handler), ctx, jobs, ui, branch, notices, messages, tick: () => heartbeat?.(), tickWatch: async () => { watchTick?.(); await flush(); }, get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
 }
 
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
+
+test('Zellij watch wakes once on a later tab screen change, not on unchanged polls', async () => {
+  let screen = 'initial';
+  const reads = [];
+  const h = harness({ readZellijTab: async (session, selection) => {
+    reads.push({ session, selection });
+    return { tabId: 9, snapshot: screen };
+  } });
+  await h.event('session_start');
+  await h.command('watch:zellij', 'term');
+  assert.match(h.ui.at(-1).message, /watching.*term/i);
+  assert.deepEqual(reads[0], { session: 'agent-zellij', selection: { tabName: 'term', ownPaneId: 42 } });
+  screen = 'fresh output before first poll';
+  h.busy(true); // streaming or compaction: do not lose an early wake
+  await h.tickWatch();
+  assert.equal(h.messages.length, 0);
+  h.busy(false);
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+  assert.match(h.messages[0].message, /term.*changed/i);
+  assert.equal(h.messages[0].options, undefined);
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+  assert.equal(reads.length, 2);
+});
+
+test('Zellij watch replacement, shutdown, and read failures do not wake stale sessions', async () => {
+  let screen = 'initial';
+  let error;
+  const h = harness({ readZellijTab: async (_, selection) => {
+    if (error) throw error;
+    return { tabId: selection.tabName === 'first' ? 1 : 2, snapshot: screen };
+  } });
+  await h.event('session_start');
+  await h.command('watch:zellij', 'first');
+  await h.command('watch:zellij', 'second');
+  await h.tickWatch(); // arm after replacement's receipt
+  screen = 'changed';
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+  assert.match(h.messages[0].message, /second/);
+  await h.command('watch:zellij', 'third');
+  h.session('session-2');
+  await h.event('session_start');
+  screen = 'changed again';
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+  await h.command('watch:zellij', 'fourth');
+  error = new Error('Zellij tab missing');
+  await h.tickWatch();
+  assert.match(h.ui.at(-1).message, /Zellij tab missing/);
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+  error = undefined;
+  await h.command('watch:zellij', 'fifth');
+  await h.event('session_shutdown');
+  screen = 'after shutdown';
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+});
+
+test('slow initial snapshot cannot replace a newer Zellij watch', async () => {
+  let finishFirst;
+  let screen = 'initial';
+  const h = harness({ readZellijTab: async (_, selection) => {
+    if (selection.tabName === 'first') return new Promise(resolve => { finishFirst = resolve; });
+    return { tabId: 2, snapshot: screen };
+  } });
+  await h.event('session_start');
+  const slow = h.command('watch:zellij', 'first');
+  await flush();
+  await h.command('watch:zellij', 'second');
+  finishFirst({ tabId: 1, snapshot: 'old screen' });
+  await slow;
+  await h.tickWatch();
+  screen = 'changed';
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+  assert.match(h.messages[0].message, /second/);
+});
+
+test('Zellij watch rejects invocation outside its owning Zellij session', async () => {
+  const h = harness({ zellijSessionName: () => '', readZellijTab: async () => ({ tabId: 1, snapshot: 'first' }) });
+  await h.event('session_start');
+  await h.command('watch:zellij', 'term');
+  assert.match(h.ui.at(-1).message, /Zellij session/i);
+  await h.tickWatch();
+  assert.equal(h.messages.length, 0);
+  const noPane = harness({ zellijPaneId: () => undefined, readZellijTab: async () => ({ tabId: 1, snapshot: 'first' }) });
+  await noPane.event('session_start');
+  await noPane.command('watch:zellij', 'term');
+  assert.match(noPane.ui.at(-1).message, /ZELLIJ_PANE_ID/);
+});
 
 test('BTW submission stays in the current session and publishes an inspectable answer', async () => {
   const h = harness();

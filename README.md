@@ -43,6 +43,13 @@ settings or reload a running session.
   their submitting session ends; independent lifetime is not supported.
   In-flight BTW queries cannot be cancelled individually; wait for the
   answer or close the session.
+- `/watch:zellij <tab name>`: in this Pi agent's Zellij session,
+  snapshot the named tab and wake this agent once when its terminal
+  viewport changes, including changes before the first poll. Requires
+  `ZELLIJ_SESSION_NAME` and `ZELLIJ_PANE_ID`; the agent's own tab cannot
+  be watched. It does not capture every output byte or survive a
+  session switch, shutdown, or extension reload. Starting another watch
+  replaces the previous one. Other watch sources are not supported yet.
 - `/& todo`: blocked until a real shared todo-provider adapter is wired.
   No task-provider bridge has been confirmed.
 - `/wrk` or `/wrk jobs`: list jobs and their names. `/wrk queues` lists

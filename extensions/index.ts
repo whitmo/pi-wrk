@@ -5,6 +5,7 @@ import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
 import { captureFocus } from '../src/focus.mjs';
 import { parseInput } from '../src/input-syntax.mjs';
 import { generateName, loadNameWords } from '../src/names.mjs';
+import { readTab } from '../src/zellij-watch.mjs';
 
 type Request = {
   runner: string;
@@ -45,7 +46,7 @@ type Context = {
 };
 type BtwResult = { answer?: string; error?: string };
 type BtwSubmission = { ctx: Context; question: string; accept(): void; done(result: BtwResult): void };
-type Pi = Pick<ExtensionAPI, 'registerCommand' | 'on' | 'events'>;
+type Pi = Pick<ExtensionAPI, 'registerCommand' | 'on' | 'events' | 'sendUserMessage'>;
 type Dependencies = {
   parseRequest(text: string, options: { alias: string }): Request;
   storePath(root: string): string;
@@ -67,6 +68,9 @@ type Dependencies = {
   setInterval(callback: () => void, ms: number): ReturnType<typeof setInterval>;
   clearInterval(handle: ReturnType<typeof setInterval>): void;
   newOwnerId(): string;
+  zellijSessionName(): string | undefined;
+  zellijPaneId(): number | undefined;
+  readZellijTab(sessionName: string, selector: { tabName?: string; tabId?: number; ownPaneId?: number }): Promise<{ tabId: number; snapshot: string }>;
 };
 
 function projectRoot(cwd: string): string {
@@ -103,6 +107,36 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   let pending: { jobId: string; snapshot: Snapshot; dir: string; ownerId: string; ctx: Context; outcome?: string; toolSeen: boolean } | undefined;
   const startupErrors = new Map<string, string>();
   const btwJobs = new Map<string, (result: BtwResult) => void>();
+  let watch: { sessionId: string; sessionName: string; tabName: string; tabId: number; snapshot?: string; changed: boolean; checking: boolean; timer?: ReturnType<typeof setInterval> } | undefined;
+  let watchGeneration = 0;
+
+  function stopWatch() {
+    watchGeneration++;
+    if (watch?.timer) deps.clearInterval(watch.timer);
+    watch = undefined;
+  }
+  async function checkWatch(ctx: Context, selected: NonNullable<typeof watch>) {
+    if (watch !== selected || selected.checking || current(ctx)?.sessionId !== selected.sessionId) return;
+    selected.checking = true;
+    try {
+      if (!selected.changed) {
+        const next = await deps.readZellijTab(selected.sessionName, { tabId: selected.tabId });
+        if (watch !== selected || current(ctx)?.sessionId !== selected.sessionId) return;
+        if (selected.snapshot === undefined) selected.snapshot = next.snapshot;
+        else selected.changed = next.snapshot !== selected.snapshot;
+      }
+      // A busy Pi may be compacting rather than streaming; followUp would be lost.
+      if (selected.changed && ctx.isIdle() && watch === selected) {
+        pi.sendUserMessage(`Zellij tab ${selected.tabName} changed; inspect its output and continue the pending work.`);
+        stopWatch();
+      }
+    } catch (error) {
+      if (watch === selected) {
+        stopWatch();
+        notify(ctx, `Zellij watch stopped: ${error instanceof Error ? error.message : String(error)}`, 'warning');
+      }
+    } finally { selected.checking = false; }
+  }
 
   function current(ctx: Context) {
     if (active?.sessionId === ctx.sessionManager.getSessionId()) return active;
@@ -276,6 +310,29 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   for (const condition of ['&&', '||', '~&&', '~||'])
     pi.registerCommand(condition, { description: `Submit conditional background job (${condition})`, handler: async (args, ctx) => { await submit(condition, args, ctx); } });
   pi.registerCommand('wrk', { description: 'Submit or inspect background jobs', handler: async (args, ctx) => manage(args, ctx) });
+  pi.registerCommand('watch:zellij', { description: 'Wake once when a named tab changes', handler: async (args, ctx) => {
+    stopWatch();
+    const generation = watchGeneration;
+    try {
+      const session = current(ctx);
+      if (!session) throw new Error('Session owner unavailable; retry after session start');
+      const tabName = args.trim();
+      if (!tabName) throw new Error('Usage: /watch:zellij <tab name>');
+      const sessionName = deps.zellijSessionName();
+      if (!sessionName) throw new Error('Zellij session unavailable (ZELLIJ_SESSION_NAME is not set)');
+      const ownPaneId = deps.zellijPaneId();
+      if (ownPaneId === undefined) throw new Error('Zellij pane unavailable (ZELLIJ_PANE_ID is not set)');
+      const first = await deps.readZellijTab(sessionName, { tabName, ownPaneId });
+      if (watchGeneration !== generation || current(ctx)?.ownerId !== session.ownerId) return;
+      const selected: NonNullable<typeof watch> = { sessionId: session.sessionId, sessionName, tabName, tabId: first.tabId, snapshot: first.snapshot, changed: false, checking: false };
+      watch = selected;
+      selected.timer = deps.setInterval(() => { void checkWatch(ctx, selected); }, 1000);
+      selected.timer.unref?.();
+      notify(ctx, `Watching Zellij tab ${tabName} for one screen change`);
+    } catch (error) {
+      if (watchGeneration === generation) notify(ctx, error instanceof Error ? error.message : String(error), 'warning');
+    }
+  } });
 
   pi.on('input', async (event, ctx) => {
     if (event.source === 'extension') return { action: 'continue' };
@@ -292,6 +349,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   });
 
   pi.on('session_start', (_event, ctx) => {
+    stopWatch();
     for (const done of btwJobs.values()) done({ error: 'Owning Pi session changed before BTW replied' });
     if (active) { deps.clearInterval(active.timer); deps.closeOwner(active.dir, active.ownerId); active = undefined; }
     if (pending) block('Session changed before the foreground settled');
@@ -327,6 +385,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   });
   pi.on('session_shutdown', (_event, ctx) => {
     if (active?.sessionId !== ctx.sessionManager.getSessionId()) return;
+    stopWatch();
     for (const done of btwJobs.values()) done({ error: 'Owning Pi session closed before BTW replied' });
     if (active) { deps.clearInterval(active.timer); deps.closeOwner(active.dir, active.ownerId); active = undefined; }
     if (pending) block('Session closed before the foreground settled');
@@ -373,5 +432,11 @@ export default async function extension(pi: ExtensionAPI): Promise<void> {
     writeNotice: store.writeNotice, touchOwner: store.touchOwner,
     closeOwner: store.closeOwner, ensureWorker: worker.ensureWorker,
     projectRoot, setInterval, clearInterval, newOwnerId: randomUUID,
+    zellijSessionName: () => process.env.ZELLIJ_SESSION_NAME,
+    zellijPaneId: () => {
+      const id = process.env.ZELLIJ_PANE_ID;
+      return id && /^(?:terminal_)?\d+$/.test(id) ? Number(id.replace('terminal_', '')) : undefined;
+    },
+    readZellijTab: readTab,
   });
 }
