@@ -29,8 +29,9 @@ export function createTabRegistry(read: Reader, ownPaneId?: () => number | undef
       for (const [name, tab] of tabs) {
         const { tabId, snapshot } = await read(sessionName, { tabName: tab.tabId === undefined ? name : undefined, tabId: tab.tabId, ownPaneId: ownPaneId?.() });
         if (generation !== current || session !== sessionName) return [];
-        const before = tab.snapshot?.split('\n') ?? [];
-        const after = snapshot.split('\n');
+        const lines = (screen: string) => screen.replace(/\n$/, '').split('\n');
+        const before = tab.snapshot === undefined ? [] : lines(tab.snapshot);
+        const after = lines(snapshot);
         // Reuse the longest retained screen overlap, including changed lines at the same position.
         let overlap = 0;
         for (let n = Math.min(before.length, after.length); n > 0; n--) {
