@@ -4,7 +4,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { createSwarmWorkspaces, integrateSwarm } from '../src/workspaces.mjs';
+import { createAt7Workspace, createSwarmWorkspaces, integrateSwarm } from '../src/workspaces.mjs';
 
 const git = (cwd, ...args) => {
   const result = spawnSync('git', ['-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8' });
@@ -26,6 +26,18 @@ function commit(workspace, name, content) {
   git(workspace.projectRoot, 'add', name);
   git(workspace.projectRoot, 'commit', '-qm', name);
 }
+
+test('@@7 triage gets its own worktree while the owner retains dirty files', t => {
+  const root = repo(t);
+  writeFileSync(join(root, 'base.txt'), 'dirty owner\n');
+  const space = createAt7Workspace(root, root);
+  assert.notEqual(space.projectRoot, root);
+  assert.match(space.branch, /^wrk\/at7-/);
+  assert.equal(readFileSync(join(space.projectRoot, 'base.txt'), 'utf8'), 'base\n');
+  commit(space, 'triage.txt', 'independent\n');
+  assert.equal(readFileSync(join(root, 'base.txt'), 'utf8'), 'dirty owner\n');
+  assert.equal(git(root, 'branch', '--show-current'), 'main');
+});
 
 test('independent child commits combine in retained integration branch without changing original checkout', t => {
   const root = repo(t);

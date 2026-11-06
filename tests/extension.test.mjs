@@ -8,7 +8,7 @@ import * as store from '../src/store.mjs';
 
 const { createExtension } = await createJiti(import.meta.url).import('../extensions/index.ts');
 
-function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure, readZellijTab, zellijSessionName, zellijPaneId } = {}) {
+function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure, readZellijTab, zellijSessionName, zellijPaneId, collectFileMessages, initialBranch } = {}) {
   const commands = new Map();
   const events = new Map();
   const bus = new Map();
@@ -24,7 +24,8 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
   let heartbeat;
   let watchTick;
   const messages = [];
-  const branch = [{ id: 'prompt-1', type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'Unfinished request' }] } }];
+  const transcript = [];
+  const branch = initialBranch ?? [{ id: 'prompt-1', type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'Unfinished request' }] } }];
   const ctx = {
     cwd: '/project', mode: 'tui', hasUI: true,
     ui: { notify: (message, type) => ui.push({ message, type }), setStatus: (key, value) => ui.push({ key, value }) },
@@ -68,17 +69,96 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
     readZellijTab: readZellijTab ?? (async () => { throw new Error('No Zellij test fixture'); }),
     zellijSessionName: zellijSessionName ?? (() => 'agent-zellij'),
     zellijPaneId: zellijPaneId ?? (() => 42),
+    collectFileMessages: collectFileMessages ?? (async () => []),
+    createAt7Workspace: () => ({ projectRoot: '/triage', cwd: '/triage', branch: 'wrk/at7-test' }),
   };
   if (realStore) Object.assign(deps, store, { storePath: () => realStore });
-  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), on: (name, handler) => events.set(name, handler), events: { emit: (name, payload) => bus.get(name)?.(payload) }, sendUserMessage: (message, options) => messages.push({ message, options }) };
+  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), on: (name, handler) => events.set(name, handler), events: { emit: (name, payload) => bus.get(name)?.(payload) }, sendUserMessage: (message, options) => messages.push({ message, options }), appendEntry: (customType, data) => branch.push({ id: `entry-${branch.length}`, type: 'custom', customType, data }), sendMessage: (message, options) => transcript.push({ message, options }) }; 
   createExtension(pi, deps);
   const command = (name, input = '') => commands.get(name)(input, ctx);
   const event = (name, payload = {}, context = ctx) => events.get(name)?.(payload, context);
-  return { command, event, onBus: (name, handler) => bus.set(name, handler), ctx, jobs, ui, branch, notices, messages, tick: () => heartbeat?.(), tickWatch: async () => { watchTick?.(); await flush(); }, get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
+  return { command, event, onBus: (name, handler) => bus.set(name, handler), ctx, jobs, ui, branch, notices, messages, transcript, tick: () => heartbeat?.(), tickWatch: async () => { watchTick?.(); await flush(); }, get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
 }
 
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
+
+test('next turn admits one @@7 job per key; reload and repeat keep it seen', async () => {
+  const item = { key: 'file:test:1:question', source: 'file', location: 'test.ts:1', text: 'question?' };
+  const scopes = [];
+  const collect = async (root, scope) => { assert.equal(root, '/project'); scopes.push(scope); return [item]; }; 
+  const h = harness({ collectFileMessages: collect });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'ordinary request' });
+  assert.equal(h.jobs.size, 1);
+  const job = [...h.jobs.values()][0];
+  assert.equal(job.ownerId, 'owner-session-1');
+  assert.equal(job.cwd, '/triage');
+  assert.equal(job.projectRoot, '/triage');
+  assert.match(job.request.prompt, /test.ts:1[\s\S]*question\?/);
+  assert.match(job.request.prompt, /dirty|uncommitted/i);
+  assert.match(job.request.prompt, /worktree/i);
+  await h.event('before_agent_start', { prompt: 'another request' });
+  assert.equal(h.jobs.size, 1);
+  const reload = harness({ collectFileMessages: collect, initialBranch: h.branch });
+  await reload.event('session_start');
+  await reload.event('before_agent_start', { prompt: 'after reload' });
+  assert.equal(reload.jobs.size, 0);
+  await reload.command('wrk', 'at7 scan --all');
+  assert.equal(reload.jobs.size, 0);
+  assert.deepEqual(scopes, ['changed', 'changed', 'changed', 'all']);
+});
+
+test('tool-created eligible tab is scanned on next turn; unrelated selected tab is never read', async () => {
+  const reads = [];
+  const h = harness({ readZellijTab: async (_, selector) => { reads.push(selector.tabName); return { tabId: 2, snapshot: '@@7 terminal ask' }; } });
+  await h.event('session_start');
+  await h.event('tool_call', { toolName: 'bash', input: { command: 'zellij action new-tab --name build' } });
+  await h.event('before_agent_start', { prompt: 'look' });
+  assert.equal(h.jobs.size, 1);
+  assert.deepEqual(reads, ['build']);
+  assert.match([...h.jobs.values()][0].request.prompt, /terminal ask/);
+});
+
+test('session switch during async collection drops old intake without recording seen', async () => {
+  let release;
+  const slow = new Promise(resolve => { release = resolve; });
+  let collecting = false;
+  const h = harness({ collectFileMessages: async () => { collecting = true; await slow; return [{ key: 'k', source: 'file', location: 'a:1', text: 'ask' }]; } });
+  await h.event('session_start');
+  const first = h.event('before_agent_start', { prompt: 'first' });
+  assert.equal(collecting, true);
+  h.session('other');
+  await h.event('session_start');
+  release(); await first;
+  assert.equal(h.jobs.size, 0);
+  assert.equal(h.branch.some(entry => entry.customType === 'wrk-at7-seen'), false);
+});
+
+test('triage notice displays bounded success or failure in transcript without waking the agent', async () => {
+  const item = { key: 'k', source: 'file', location: 'a:1', text: 'ask' };
+  const h = harness({ collectFileMessages: async () => [item] });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'request' });
+  const job = [...h.jobs.values()][0];
+  h.jobs.get(job.id).status = 'succeeded';
+  h.jobs.get(job.id).summary = 'answered the question';
+  h.notices.push({ id: 'note-1', jobId: job.id, message: 'completed', kind: 'succeeded' });
+  h.tick();
+  assert.equal(h.transcript.length, 1);
+  assert.equal(h.transcript[0].options.triggerTurn, false);
+  assert.match(h.transcript[0].message.content, /answered the question/);
+  assert.equal(h.messages.length, 0);
+  h.tick(); assert.equal(h.transcript.length, 1);
+  h.notices.push({ id: 'note-2', jobId: job.id, message: 'failed to act', kind: 'failed' });
+  h.tick(); assert.equal(h.transcript.length, 2);
+  const reload = harness({ initialBranch: h.branch });
+  await reload.event('session_start');
+  reload.jobs.set(job.id, job);
+  reload.notices.push({ id: 'note-reload', jobId: job.id, message: 'result retained', kind: 'succeeded' });
+  reload.tick();
+  assert.equal(reload.transcript.length, 1);
+});
 
 test('explicit at7 tab registration does not start a watch or wake an idle session', async () => {
   const h = harness({ readZellijTab: async () => ({ tabId: 9, snapshot: '@@7 old' }) });
