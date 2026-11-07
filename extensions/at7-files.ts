@@ -8,8 +8,8 @@ const exec = promisify(execFile);
 const marker = /^\s*(?:#|\/\/|--|\/\*|\*|<!--)\s*@@7(?=\s|:[@+:])(.+?)\s*(?:\*\/|-->)?\s*$/;
 
 export function message(source: At7Message['source'], location: string, line: string): At7Message | undefined {
-  const raw = (source === 'zellij' ? /^\s*@@7\s+(.+?)\s*$/.exec(line)?.[1] : undefined) ?? marker.exec(line)?.[1]?.trim();
-  const text = raw?.startsWith(':') ? `@@7${raw}` : raw?.trim();
+  const raw = (source === 'zellij' ? /^\s*@@7\s+(.+?)\s*$/.exec(line)?.[1] : undefined) ?? marker.exec(line)?.[1];
+  const text = source === 'file' && raw?.startsWith(':') ? `@@7${raw.trim()}` : raw?.trim();
   if (!text) return undefined;
   const item: At7Message = { source, location, text, key: JSON.stringify([source, location, text]) };
   if (source === 'file') {
