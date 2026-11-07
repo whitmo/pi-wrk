@@ -1008,3 +1008,72 @@ test('pending addressed comment retries after reload even when no longer in chan
   registration.onEvent({ type: 'message', fromSessionId: 'receiver', payload: { kind: 'ack', key: sent[0].key, target: 'sender' } });
   assert.equal(h.branch.filter(e => e.customType === 'wrk-at7-peer-outbox').at(-1).data.state, 'delivered');
 });
+
+test('pinned peer survives name reuse and reload; only original session can ACK', async t => {
+  const previous = process.env.PI_INTERCOM_SESSION_ID;
+  process.env.PI_INTERCOM_SESSION_ID = 'sender';
+  t.after(() => { if (previous === undefined) delete process.env.PI_INTERCOM_SESSION_ID; else process.env.PI_INTERCOM_SESSION_ID = previous; });
+  const item = { key: 'pinned-comment', source: 'file', location: 'a.ts:1', text: 'check', recipient: 'BEACON' };
+  let peers = [{ id: 'sender', name: 'writer' }, { id: 'original', name: 'BEACON' }], registration, scans = 0;
+  const sent = [];
+  const h = harness({ collectFileMessages: async () => ++scans === 1 ? [item] : [], peerRegister: value => { registration = value; value.onReady({ snapshot: () => ({ connected: true, supported: true }), listSessions: async () => peers, publish: signal => sent.push(signal) }); } });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'first' });
+  assert.equal(sent[0].target, 'original');
+  assert.equal(h.branch.filter(e => e.customType === 'wrk-at7-peer-outbox').at(-1).data.target, 'original');
+  peers = [{ id: 'sender', name: 'writer' }, { id: 'replacement', name: 'BEACON' }];
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'after reload' });
+  assert.equal(sent.length, 1, 'do not reroute old comment to the new name holder');
+  registration.onEvent({ type: 'message', fromSessionId: 'replacement', payload: { kind: 'ack', key: sent[0].key, target: 'sender' } });
+  assert.equal(h.branch.filter(e => e.customType === 'wrk-at7-peer-outbox').at(-1).data.state, 'pending');
+  peers = [...peers, { id: 'original', name: 'different-name' }];
+  await h.event('before_agent_start', { prompt: 'original returns' });
+  assert.equal(sent.at(-1).target, 'original');
+  registration.onEvent({ type: 'message', fromSessionId: 'original', payload: { kind: 'ack', key: sent[0].key, target: 'sender' } });
+  assert.equal(h.branch.filter(e => e.customType === 'wrk-at7-peer-outbox').at(-1).data.state, 'delivered');
+});
+
+test('backlog of addressed comments lists live sessions once per owner turn', async t => {
+  const previous = process.env.PI_INTERCOM_SESSION_ID;
+  process.env.PI_INTERCOM_SESSION_ID = 'sender';
+  t.after(() => { if (previous === undefined) delete process.env.PI_INTERCOM_SESSION_ID; else process.env.PI_INTERCOM_SESSION_ID = previous; });
+  let lists = 0;
+  const sent = [];
+  const items = Array.from({ length: 4 }, (_, i) => ({ key: `batch-${i}`, source: 'file', location: `a.ts:${i + 1}`, text: 'check', recipient: 'BEACON' }));
+  const h = harness({ collectFileMessages: async () => items, peerRegister: value => value.onReady({ snapshot: () => ({ connected: true, supported: true }), listSessions: async () => { lists++; return [{ id: 'sender', name: 'writer' }, { id: 'original', name: 'BEACON' }]; }, publish: signal => sent.push(signal) }) });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'first' });
+  assert.equal(sent.length, 4);
+  assert.equal(lists, 1);
+  await h.event('before_agent_start', { prompt: 'retry' });
+  assert.equal(lists, 2);
+  assert.equal(sent.length, 8);
+});
+
+test('local unaddressed author and claim remain labeled untrusted in triage prompt', async () => {
+  const h = harness({ collectFileMessages: async () => [{ key: 'roles', source: 'file', location: 'a.ts:1', text: 'look here', author: 'impersonator', claimedBy: 'BEACON' }] });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'owner turn' });
+  const prompt = [...h.jobs.values()][0].request.prompt;
+  assert.match(prompt, /look here/);
+  assert.match(prompt, /impersonator/);
+  assert.match(prompt, /BEACON/);
+  assert.match(prompt, /untrusted|lower-trust/i);
+  assert.match(prompt, /not.*approval/i);
+});
+
+test('first resolved recipient remains pinned if publication fails before ACK', async t => {
+  const previous = process.env.PI_INTERCOM_SESSION_ID;
+  process.env.PI_INTERCOM_SESSION_ID = 'sender';
+  t.after(() => { if (previous === undefined) delete process.env.PI_INTERCOM_SESSION_ID; else process.env.PI_INTERCOM_SESSION_ID = previous; });
+  let peers = [{ id: 'sender', name: 'writer' }, { id: 'original', name: 'BEACON' }], sent = 0;
+  const h = harness({ collectFileMessages: async () => [{ key: 'failed-first', source: 'file', location: 'a.ts:1', text: 'check', recipient: 'BEACON' }], peerRegister: value => value.onReady({ snapshot: () => ({ connected: true, supported: true }), listSessions: async () => peers, publish: () => { sent++; throw new Error('disconnected during publish'); } }) });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'first' });
+  assert.equal(h.branch.filter(e => e.customType === 'wrk-at7-peer-outbox').at(-1).data.target, 'original');
+  peers = [{ id: 'sender', name: 'writer' }, { id: 'replacement', name: 'BEACON' }];
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'name reused' });
+  assert.equal(sent, 1, 'never attempt publication to a replacement name holder');
+});

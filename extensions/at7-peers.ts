@@ -10,6 +10,7 @@ type Bus = { events: { on(name: string, fn: () => void): unknown; emit(name: str
 export function createAt7PeerRelay(pi: Bus, identity: () => string | undefined, handlers: { onSignal(signal: Signal): void; onAck(ack: Ack): void }) {
   let channel: Channel | undefined;
   const offered = new Map<string, string>();
+  const pinned = new Map<string, string>();
   const registration = {
     namespace: 'pi-wrk-at7', ownerEligible: false,
     onReady(ready: Channel) { channel = ready; },
@@ -23,24 +24,36 @@ export function createAt7PeerRelay(pi: Bus, identity: () => string | undefined, 
         handlers.onSignal({ ...payload, kind: 'signal', senderSessionId: event.fromSessionId } as Signal);
       if (payload.kind === 'ack' && payload.target === identity() && typeof payload.key === 'string' && offered.get(payload.key) === event.fromSessionId) {
         offered.delete(payload.key);
+        pinned.delete(payload.key);
         handlers.onAck({ kind: 'ack', key: payload.key, target: payload.target! });
       }
     },
   };
   pi.events.on('intercom:extension-registry-ready', () => { if (!channel) pi.events.emit('intercom:extension-register', registration); });
   pi.events.emit('intercom:extension-register', registration);
+  async function listPeers(): Promise<Session[] | undefined> {
+    if (!channel?.snapshot().connected || !channel.snapshot().supported) return undefined;
+    try { return await channel.listSessions(); }
+    catch { return undefined; }
+  }
   return {
-    async send(item: At7Message, root: string): Promise<'offered' | 'unavailable' | 'unknown' | 'ambiguous'> {
+    listPeers,
+    async send(item: At7Message, root: string, options?: { sessions?: Session[]; pinnedTarget?: string; onResolved?(id: string): void }): Promise<'offered' | 'unavailable' | 'unknown' | 'ambiguous'> {
       const self = identity();
       if (!self || !channel?.snapshot().connected || !channel.snapshot().supported) return 'unavailable';
-      const sessions = await channel.listSessions();
-      const byId = sessions.filter(peer => peer.id !== self && peer.id === item.recipient);
-      const matches = byId.length ? byId : sessions.filter(peer => peer.id !== self && peer.name === item.recipient);
-      if (matches.length !== 1) return matches.length ? 'ambiguous' : 'unknown';
+      const sessions = options ? options.sessions : await listPeers();
+      if (!sessions) return 'unavailable';
       const key = JSON.stringify([self, item.key]);
+      const prior = options?.pinnedTarget ?? pinned.get(key);
+      const byId = sessions.filter(peer => peer.id !== self && peer.id === (prior ?? item.recipient));
+      const matches = (prior || byId.length) ? byId : sessions.filter(peer => peer.id !== self && peer.name === item.recipient);
+      if (matches.length !== 1) return matches.length ? 'ambiguous' : 'unknown';
+      const target = matches[0].id;
+      if (!prior) options?.onResolved?.(target);
+      pinned.set(key, target);
       try {
-        offered.set(key, matches[0].id);
-        channel.publish({ kind: 'signal', key, senderSessionId: self, target: matches[0].id, root, item }, { audience: 'capable' });
+        offered.set(key, target);
+        channel.publish({ kind: 'signal', key, senderSessionId: self, target, root, item }, { audience: 'capable' });
         return 'offered';
       } catch { offered.delete(key); return 'unavailable'; }
     },
