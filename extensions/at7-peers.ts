@@ -17,7 +17,7 @@ export function createAt7PeerRelay(pi: Bus, identity: () => string | undefined, 
       if (event.type !== 'message' || !event.fromSessionId || !identity() || !event.payload || typeof event.payload !== 'object') return;
       const payload = event.payload as Partial<Signal> | Partial<Ack>;
       if (payload.kind === 'signal' && payload.target === identity() && typeof payload.key === 'string' &&
-          payload.item?.source === 'file' && typeof payload.item.key === 'string' && typeof payload.item.text === 'string' &&
+          payload.item?.source === 'file' && typeof payload.item.recipient === 'string' && typeof payload.item.key === 'string' && typeof payload.item.text === 'string' &&
           typeof payload.item.location === 'string' && typeof payload.root === 'string' &&
           payload.key === JSON.stringify([event.fromSessionId, payload.item.key]))
         handlers.onSignal({ ...payload, kind: 'signal', senderSessionId: event.fromSessionId } as Signal);

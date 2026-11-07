@@ -53,6 +53,8 @@ test('comment tags describe an addressed message, not terminal input', async () 
   assert.equal(tagged?.claimedBy, 'BEACON');
   assert.equal(tagged?.text, 'check');
   assert.equal(message('file', 'src/a.ts:1', '// @@7 check')?.text, 'check');
+  assert.equal(message('file', 'src/a.ts:1', '// @@7 :plain')?.text, ':plain');
+  assert.equal(message('zellij', 'tab', '@@7 :plain')?.text, ':plain');
   assert.equal(message('file', 'src/a.ts:1', '// @@7:@agent#1.v_2-x check')?.recipient, 'agent#1.v_2-x');
   assert.equal(message('file', 'src/a.ts:1', '// @@7:@sensible-yak:term check'), undefined);
   assert.equal(message('file', 'src/a.ts:1', '// @@7:@BEACON'), undefined);
