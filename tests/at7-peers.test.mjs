@@ -28,6 +28,8 @@ test('registers in either load order; resolves exact unique live agent, not tab'
   assert.equal(await h.relay.send(item, '/sender'), 'ambiguous');
   assert.equal(await h.relay.send({ ...item, recipient: 'sensible-yak:term' }, '/sender'), 'unknown');
   assert.equal(await h.relay.send({ ...item, recipient: 'target' }, '/sender'), 'offered');
+  h.setSessions([{ id: 'sender', name: 'writer' }, { id: 'target', name: 'BEACON' }, { id: 'other', name: 'target' }]);
+  assert.equal(await h.relay.send({ ...item, recipient: 'target' }, '/sender'), 'offered');
   h.setSessions([{ id: 'sender', name: 'writer' }]);
   assert.equal(await h.relay.send(item, '/sender'), 'unknown');
   h.disconnect();

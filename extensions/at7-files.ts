@@ -3,7 +3,7 @@ import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
-export type At7Message = { key: string; source: 'file' | 'zellij'; location: string; text: string; recipient?: string; claimedBy?: string; author?: string }; 
+export type At7Message = { key: string; source: 'file' | 'zellij'; location: string; text: string; recipient?: string; claimedBy?: string; author?: string };
 const exec = promisify(execFile);
 const marker = /^\s*(?:#|\/\/|--|\/\*|\*|<!--)\s*@@7(?=\s|:[@+:])(.+?)\s*(?:\*\/|-->)?\s*$/;
 
