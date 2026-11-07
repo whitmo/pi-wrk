@@ -23,7 +23,7 @@ export function createAt7PeerRelay(pi: Bus, identity: () => string | undefined, 
         handlers.onSignal({ ...payload, kind: 'signal', senderSessionId: event.fromSessionId } as Signal);
       if (payload.kind === 'ack' && payload.target === identity() && typeof payload.key === 'string' && offered.get(payload.key) === event.fromSessionId) {
         offered.delete(payload.key);
-        handlers.onAck({ kind: 'ack', key: payload.key, target: payload.target });
+        handlers.onAck({ kind: 'ack', key: payload.key, target: payload.target! });
       }
     },
   };
@@ -34,14 +34,15 @@ export function createAt7PeerRelay(pi: Bus, identity: () => string | undefined, 
       const self = identity();
       if (!self || !channel?.snapshot().connected || !channel.snapshot().supported) return 'unavailable';
       const sessions = await channel.listSessions();
-      const matches = sessions.filter(peer => peer.id !== self && (peer.id === item.recipient || peer.name === item.recipient));
+      const byId = sessions.filter(peer => peer.id !== self && peer.id === item.recipient);
+      const matches = byId.length ? byId : sessions.filter(peer => peer.id !== self && peer.name === item.recipient);
       if (matches.length !== 1) return matches.length ? 'ambiguous' : 'unknown';
       const key = JSON.stringify([self, item.key]);
       try {
-        channel.publish({ kind: 'signal', key, senderSessionId: self, target: matches[0].id, root, item }, { audience: 'capable' });
         offered.set(key, matches[0].id);
+        channel.publish({ kind: 'signal', key, senderSessionId: self, target: matches[0].id, root, item }, { audience: 'capable' });
         return 'offered';
-      } catch { return 'unavailable'; }
+      } catch { offered.delete(key); return 'unavailable'; }
     },
     ack(signal: Signal) {
       if (!channel?.snapshot().connected || !channel.snapshot().supported || !identity()) return;

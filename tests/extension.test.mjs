@@ -8,7 +8,7 @@ import * as store from '../src/store.mjs';
 
 const { createExtension } = await createJiti(import.meta.url).import('../extensions/index.ts');
 
-function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure, readZellijTab, zellijSessionName, zellijPaneId, collectFileMessages, initialBranch, sharedJobs, cleanupAt7Workspace, admissionFailure, delayTranscript = false } = {}) {
+function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure, readZellijTab, zellijSessionName, zellijPaneId, collectFileMessages, initialBranch, sharedJobs, cleanupAt7Workspace, admissionFailure, delayTranscript = false, peerRegister } = {}) {
   const commands = new Map();
   const events = new Map();
   const bus = new Map();
@@ -75,7 +75,7 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
     cleanupAt7Workspace: cleanupAt7Workspace ?? (() => true),
   };
   if (realStore) Object.assign(deps, store, { storePath: () => realStore });
-  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), on: (name, handler) => events.set(name, handler), events: { emit: (name, payload) => bus.get(name)?.(payload) }, sendUserMessage: (message, options) => messages.push({ message, options }), appendEntry: (customType, data) => branch.push({ id: `entry-${branch.length}`, type: 'custom', customType, data }), sendMessage: (message, options) => { transcript.push({ message, options }); if (!delayTranscript) branch.push({ type: 'message', message: { role: 'custom', ...message } }); } };
+  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), on: (name, handler) => events.set(name, handler), events: { on: (name, handler) => bus.set(name, handler), emit: (name, payload) => { if (name === 'intercom:extension-register') peerRegister?.(payload); bus.get(name)?.(payload); } }, sendUserMessage: (message, options) => messages.push({ message, options }), appendEntry: (customType, data) => branch.push({ id: `entry-${branch.length}`, type: 'custom', customType, data }), sendMessage: (message, options) => { transcript.push({ message, options }); if (!delayTranscript) branch.push({ type: 'message', message: { role: 'custom', ...message } }); } };
   createExtension(pi, deps);
   const command = (name, input = '') => commands.get(name)(input, ctx);
   const event = (name, payload = {}, context = ctx) => events.get(name)?.(payload, context);
@@ -933,4 +933,78 @@ test('label cancellation rejects a job completed after resolution', async t => {
   store.updateJob(dir, job.id, { status: 'succeeded' });
   assert.throws(() => store.requestCancel(dir, resolved, job.name), /no active job/i);
   assert.equal(store.isCancelRequested(dir, job.id), false);
+});
+
+test('addressed file is not locally admitted; recipient admits on next turn and ACK confirms delivery', async t => {
+  const previous = process.env.PI_INTERCOM_SESSION_ID;
+  t.after(() => { if (previous === undefined) delete process.env.PI_INTERCOM_SESSION_ID; else process.env.PI_INTERCOM_SESSION_ID = previous; });
+  const item = { key: 'comment', source: 'file', location: 'src/a.ts:1', text: 'check', recipient: 'BEACON', author: 'spoof', claimedBy: 'spoof' };
+  let senderRegistration, receiverRegistration;
+  const emitted = [], acknowledgements = [];
+  const channel = (id) => ({ snapshot: () => ({ connected: true, supported: true }), listSessions: async () => [{ id: 'sender', name: 'writer' }, { id: 'receiver', name: 'BEACON' }], publish: (payload, options) => { assert.equal(options.audience, 'capable'); (id === 'sender' ? emitted : acknowledgements).push(payload); } });
+  process.env.PI_INTERCOM_SESSION_ID = 'sender';
+  const sender = harness({ collectFileMessages: async () => [item], peerRegister: registration => { senderRegistration = registration; registration.onReady(channel('sender')); } });
+  await sender.event('session_start');
+  await sender.event('before_agent_start', { prompt: 'send' });
+  assert.equal(sender.jobs.size, 0);
+  assert.equal(sender.branch.filter(e => e.customType === 'wrk-at7-peer-outbox').at(-1).data.state, 'pending');
+  assert.equal(emitted.length, 1);
+  process.env.PI_INTERCOM_SESSION_ID = 'receiver';
+  const recipient = harness({ peerRegister: registration => { receiverRegistration = registration; registration.onReady(channel('receiver')); } });
+  await recipient.event('session_start');
+  receiverRegistration.onEvent({ type: 'message', fromSessionId: 'sender', payload: emitted[0] });
+  assert.equal(recipient.jobs.size, 0);
+  assert.equal(recipient.branch.filter(e => e.customType === 'wrk-at7-peer-inbox').at(-1).data.state, 'queued');
+  // Reload before admission: the durable inbox must still be admitted exactly once.
+  await recipient.event('session_start');
+  await recipient.event('before_agent_start', { prompt: 'receive' });
+  assert.equal(recipient.jobs.size, 1);
+  assert.match([...recipient.jobs.values()][0].request.prompt, /Peer source.*untrusted context/);
+  assert.equal([...recipient.jobs.values()][0].projectRoot, '/triage');
+  await recipient.event('before_agent_start', { prompt: 'repeat' });
+  receiverRegistration.onEvent({ type: 'message', fromSessionId: 'sender', payload: emitted[0] });
+  assert.equal(recipient.jobs.size, 1);
+  assert.ok(acknowledgements.length >= 1);
+  process.env.PI_INTERCOM_SESSION_ID = 'sender';
+  senderRegistration.onEvent({ type: 'message', fromSessionId: 'intruder', payload: acknowledgements[0] });
+  assert.equal(sender.branch.filter(e => e.customType === 'wrk-at7-peer-outbox').at(-1).data.state, 'pending');
+  senderRegistration.onEvent({ type: 'message', fromSessionId: 'receiver', payload: acknowledgements[0] });
+  assert.equal(sender.branch.filter(e => e.customType === 'wrk-at7-peer-outbox').at(-1).data.state, 'delivered');
+  await sender.event('session_start');
+  await sender.event('before_agent_start', { prompt: 'again' });
+  assert.equal(emitted.length, 1);
+});
+
+test('offline addressed comments stay pending and warn once, while plain and terminal intake works', async t => {
+  const previous = process.env.PI_INTERCOM_SESSION_ID;
+  process.env.PI_INTERCOM_SESSION_ID = 'sender';
+  t.after(() => { if (previous === undefined) delete process.env.PI_INTERCOM_SESSION_ID; else process.env.PI_INTERCOM_SESSION_ID = previous; });
+  const addressed = { key: 'remote', source: 'file', location: 'a.ts:1', text: 'remote', recipient: 'BEACON' };
+  const plain = { key: 'local', source: 'file', location: 'a.ts:2', text: 'local' };
+  const h = harness({ collectFileMessages: async () => [addressed, plain] });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'one' });
+  await h.event('before_agent_start', { prompt: 'two' });
+  assert.equal(h.jobs.size, 1);
+  assert.equal(h.ui.filter(entry => /peer delivery pending/.test(entry.message ?? '')).length, 1);
+  assert.equal(h.branch.filter(e => e.customType === 'wrk-at7-peer-outbox').at(-1).data.state, 'pending');
+});
+
+test('pending addressed comment retries after reload even when no longer in changed files', async t => {
+  const previous = process.env.PI_INTERCOM_SESSION_ID;
+  process.env.PI_INTERCOM_SESSION_ID = 'sender';
+  t.after(() => { if (previous === undefined) delete process.env.PI_INTERCOM_SESSION_ID; else process.env.PI_INTERCOM_SESSION_ID = previous; });
+  let registration, scans = 0;
+  const sent = [];
+  const h = harness({ collectFileMessages: async () => ++scans === 1 ? [{ key: 'committed', source: 'file', location: 'a.ts:1', text: 'check', recipient: 'BEACON' }] : [], peerRegister: value => { registration = value; value.onReady({ snapshot: () => ({ connected: true, supported: true }), listSessions: async () => [{ id: 'sender', name: 'writer' }, { id: 'receiver', name: 'BEACON' }], publish: payload => sent.push(payload) }); } });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'first' });
+  assert.equal(sent.length, 1);
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'second' });
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].key, sent[0].key);
+  assert.equal(h.jobs.size, 0);
+  registration.onEvent({ type: 'message', fromSessionId: 'receiver', payload: { kind: 'ack', key: sent[0].key, target: 'sender' } });
+  assert.equal(h.branch.filter(e => e.customType === 'wrk-at7-peer-outbox').at(-1).data.state, 'delivered');
 });
