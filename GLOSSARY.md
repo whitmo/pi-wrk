@@ -30,3 +30,18 @@ _Avoid_: Any agent that can read the worktree
 A background agent that interprets an @@7 message and either handles
 safe independent work or hands work to the worktree owner.
 _Avoid_: Worktree owner
+
+**Agent identity**:
+A Pi peer name or session ID used to address a live agent, independent
+of its terminal tab.
+_Avoid_: Tab address
+
+**@@7 claim**:
+An agent's declared responsibility for an @@7 message. A claim is
+advisory; it does not prove identity or grant permission.
+_Avoid_: Lock, approval
+
+**@@7 author**:
+The agent named as the source of an @@7 comment. The comment alone does
+not verify who wrote it.
+_Avoid_: Verified sender
