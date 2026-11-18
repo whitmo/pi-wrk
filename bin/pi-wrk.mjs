@@ -15,11 +15,14 @@ async function main(args) {
   if (!isAbsolute(storeDir)) throw new Error('store must be absolute');
   storeDir = resolve(storeDir);
   if (command === 'worker') {
-    if (args.length) throw new Error('usage: worker --store <absolute path>');
+    const replaceIndex = args.indexOf('--replace');
+    const replaces = replaceIndex < 0 ? undefined : args[replaceIndex + 1];
+    if (replaceIndex >= 0) args.splice(replaceIndex, 2);
+    if (args.length || replaceIndex >= 0 && !/^[0-9a-f-]{36}$/i.test(replaces ?? '')) throw new Error('usage: worker --store <absolute path> [--replace <token>]');
     const controller = new AbortController();
     process.once('SIGINT', () => controller.abort());
     process.once('SIGTERM', () => controller.abort());
-    await runWorker({ storeDir, signal: controller.signal });
+    await runWorker({ storeDir, signal: controller.signal, replaces });
     return;
   }
   if (command === 'jobs') {

@@ -34,7 +34,13 @@ and `until-true` for bounded logical workflows, not automatic loops.
 
 A leading `--lifetime independent` keeps a job alive after the submitting
 session closes; the default `session` lifetime uses a heartbeat lease,
-even for jobs in a named queue. The project store is `.agents/wrk/` and
+even for jobs in a named queue. Reloading the Pi extension retains the same
+session lease; quit or session replacement closes it. A compatible worker
+update starts a ready replacement while old active jobs and workflow children
+drain. Queued and new roots move after readiness. Check `/wrk status` or
+`worker.log` if replacement startup fails; the old worker keeps serving.
+A pre-upgrade token-only worker cannot hand off: wait for its work to drain
+and arrange a safe manual stop before retrying. The project store is `.agents/wrk/` and
 is local private runtime data, not Git state. Reconnect via `/wrk` in the
 same project. Inspect a BTW result with `/wrk status <id>` or
 `/wrk output <id>`; open `/btw` to follow up in its retained side thread.

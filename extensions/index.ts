@@ -496,7 +496,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     }
   });
 
-  pi.on('session_start', (_event, ctx) => {
+  pi.on('session_start', (event, ctx) => {
     stopWatch();
     tabs.clear();
     seen.clear();
@@ -527,11 +527,24 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     }
     for (const entry of journal.values()) if (entry.state === 'pending' && displayedAt7(ctx, entry.jobId)) recordAt7({ ...entry, state: 'delivered' });
     for (const done of btwJobs.values()) done({ error: 'Owning Pi session changed before BTW replied' });
-    if (active) { deps.clearInterval(active.timer); deps.closeOwner(active.dir, active.ownerId); active = undefined; }
-    if (pending) block('Session changed before the foreground settled');
     const dir = deps.storePath(deps.projectRoot(ctx.cwd));
-    const ownerId = deps.newOwnerId();
+    const sessionId = ctx.sessionManager.getSessionId();
+    // Only a reload of this same session can inherit its lease. A quit or a
+    // session change writes a tombstone; a copied/forked transcript cannot
+    // inherit a different session's owner.
+    const leaseEntry = [...ctx.sessionManager.getBranch()].reverse().find(entry => entry.type === 'custom' && entry.customType === 'wrk-owner') as { data?: unknown } | undefined;
+    const previous = leaseEntry?.data as
+      { sessionId?: string; ownerId?: string; dir?: string; closed?: boolean } | undefined;
+    const reuse = event.reason === 'reload' && previous?.sessionId === sessionId && previous.dir === dir && !previous.closed;
+    if (active) {
+      deps.clearInterval(active.timer);
+      if (!reuse) deps.closeOwner(active.dir, active.ownerId);
+      active = undefined;
+    }
+    if (pending) block('Session changed before the foreground settled');
+    const ownerId = reuse ? previous!.ownerId! : deps.newOwnerId();
     deps.touchOwner(dir, ownerId);
+    if (!reuse) pi.appendEntry('wrk-owner', { sessionId, ownerId, dir, closed: false });
     const delivered = new Set<string>();
     const timer = deps.setInterval(() => {
       if (current(ctx)?.ownerId !== ownerId) return;
@@ -582,12 +595,19 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     pending = undefined;
     ctx.ui.setStatus('wrk', undefined);
   });
-  pi.on('session_shutdown', (_event, ctx) => {
+  pi.on('session_shutdown', (event, ctx) => {
     if (active?.sessionId !== ctx.sessionManager.getSessionId()) return;
     stopWatch();
     tabs.clear();
     for (const done of btwJobs.values()) done({ error: 'Owning Pi session closed before BTW replied' });
-    if (active) { deps.clearInterval(active.timer); deps.closeOwner(active.dir, active.ownerId); active = undefined; }
+    if (active) {
+      deps.clearInterval(active.timer);
+      if (event.reason !== 'reload') {
+        deps.closeOwner(active.dir, active.ownerId);
+        pi.appendEntry('wrk-owner', { sessionId: active.sessionId, ownerId: active.ownerId, dir: active.dir, closed: true });
+      }
+      active = undefined;
+    }
     if (pending) block('Session closed before the foreground settled');
     turn = undefined;
     ctx.ui.setStatus('wrk', undefined);
