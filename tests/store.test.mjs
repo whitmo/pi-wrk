@@ -3,9 +3,10 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, symlinkSync, statSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
-import { parse } from 'yaml';
+import { parse, stringify } from 'yaml';
+import { spawn } from 'node:child_process';
 import {
-  storePath, admitJob, listJobs, getJob, updateJob, requestCancel,
+  storePath, admitJob, listJobs, listWorkerJobs, getJob, updateJob, requestCancel, claimQueuedJob,
   isCancelRequested, touchOwner, closeOwner, ownerAlive, readJobOutput,
   appendJobOutput, writeNotice, readNotices, listQueues,
 } from '../src/store.mjs';
@@ -43,6 +44,24 @@ test('local BTW jobs are admitted running atomically and ordinary jobs stay queu
   assert.equal(getJob(dir, btw.id).status, 'running');
   assert.equal(admitJob(dir, input).status, 'queued');
   assert.throws(() => admitJob(dir, { ...input, initialStatus: 'running' }), /initial status/i);
+});
+
+test('equal-millisecond queued jobs retain admission order, not UUID order', t => {
+  const { dir, input } = fixture(t);
+  const jobs = [admitJob(dir, input), admitJob(dir, input), admitJob(dir, input)];
+  assert.ok(BigInt(jobs[0].admittedAtNs) < BigInt(jobs[1].admittedAtNs));
+  assert.ok(BigInt(jobs[1].admittedAtNs) < BigInt(jobs[2].admittedAtNs));
+  const [legacy, first, second] = jobs.sort((a, b) => b.id.localeCompare(a.id));
+  for (const [job, order] of [[first, '1'], [second, '2']]) {
+    const path = join(dir, 'jobs', `${job.id}.yaml`);
+    writeFileSync(path, stringify({ ...parse(readFileSync(path, 'utf8')),
+      createdAt: '2026-01-01T00:00:00.000Z', admittedAtNs: order }));
+  }
+  const oldPath = join(dir, 'jobs', `${legacy.id}.yaml`);
+  const oldRecord = parse(readFileSync(oldPath, 'utf8'));
+  delete oldRecord.admittedAtNs;
+  writeFileSync(oldPath, stringify({ ...oldRecord, createdAt: '2026-01-01T00:00:00.000Z' }));
+  assert.deepEqual(listJobs(dir).reverse().map(job => job.id), [legacy.id, first.id, second.id]);
 });
 
 test('queue definitions survive jobs and reject path-like queue names', t => {
@@ -129,6 +148,36 @@ test('cancellation markers are separate and durable, leases expire or close', t 
   assert.throws(() => requestCancel(dir, '11111111-1111-4111-8111-111111111111'), /missing|not found/i);
 });
 
+test('queued claim and cancellation serialize under the same job lock', t => {
+  const { dir, input } = fixture(t);
+  touchOwner(dir, input.ownerId);
+  const cancelled = admitJob(dir, input);
+  requestCancel(dir, cancelled.id);
+  assert.equal(claimQueuedJob(dir, cancelled.id, { leaseMs: 15000, startStatus: 'running' }), null);
+  assert.equal(getJob(dir, cancelled.id).status, 'queued');
+  const started = admitJob(dir, input);
+  assert.equal(claimQueuedJob(dir, started.id, { leaseMs: 15000, startStatus: 'running' }).status, 'running');
+  requestCancel(dir, started.id);
+  assert.equal(isCancelRequested(dir, started.id), true);
+  assert.equal(claimQueuedJob(dir, started.id, { leaseMs: 15000, startStatus: 'running' }), null);
+  closeOwner(dir, input.ownerId);
+  const expired = admitJob(dir, input);
+  assert.equal(claimQueuedJob(dir, expired.id, { leaseMs: 15000, startStatus: 'running' }), null);
+});
+
+test('worker inventory refuses a corrupt job that normal listings omit', t => {
+  const { dir, input } = fixture(t);
+  const job = admitJob(dir, input);
+  const path = join(dir, 'jobs', `${job.id}.yaml`);
+  const original = readFileSync(path);
+  writeFileSync(path, 'invalid: [');
+  assert.deepEqual(listJobs(dir), []);
+  assert.throws(() => listWorkerJobs(dir), /corrupt|yaml|invalid/i);
+  writeFileSync(path, original);
+  updateJob(dir, job.id, { status: 'runningg' });
+  assert.throws(() => listWorkerJobs(dir), /corrupt|invalid/i);
+});
+
 test('output retention is bounded and reads a UTF-8-safe byte tail', t => {
   const { dir, input } = fixture(t);
   const a = admitJob(dir, input);
@@ -162,4 +211,48 @@ test('symlinked store entries cannot redirect reads or writes outside the store'
   symlinkSync(elsewhere, join(dir, 'output', `${a.id}.log`));
   assert.throws(() => appendJobOutput(dir, a.id, 'bad'), /symlink|invalid/i);
   assert.equal(readFileSync(elsewhere, 'utf8'), 'unchanged');
+});
+
+
+test('conditional predecessor is validated, same-owner root and immutable; verdict is durable', t => {
+  const { dir, input } = fixture(t);
+  const first = admitJob(dir, input);
+  const next = admitJob(dir, { ...input, condition: '&&', predecessorId: first.id });
+  assert.equal(getJob(dir, next.id).predecessorId, first.id);
+  assert.equal(getJob(dir, next.id).condition, '&&');
+  updateJob(dir, first.id, { verdict: 'failure' });
+  assert.equal(getJob(dir, first.id).verdict, 'failure');
+  for (const patch of [{ condition: '||' }, { predecessorId: first.id }])
+    assert.throws(() => updateJob(dir, next.id, patch), /immutable/i);
+  const other = admitJob(dir, { ...input, ownerId: 'other' });
+  const child = admitJob(dir, { ...input, parentId: first.id });
+  for (const predecessorId of [other.id, child.id, '../bad'])
+    assert.throws(() => admitJob(dir, { ...input, condition: '||', predecessorId }), /predecessor|owner|root|id/i);
+  assert.throws(() => admitJob(dir, { ...input, condition: '&&' }), /predecessor/i);
+  assert.throws(() => admitJob(dir, { ...input, predecessorId: first.id }), /condition/i);
+  assert.throws(() => admitJob(dir, { ...input, parentId: first.id, condition: '&&', predecessorId: first.id }), /root|child/i);
+  assert.throws(() => updateJob(dir, first.id, { verdict: 'perhaps' }), /verdict/i);
+});
+
+test('separate sessions claiming the same label produce one durable winner', async t => {
+  const { dir, input } = fixture(t);
+  const script = `import { admitJob } from ${JSON.stringify(new URL('../src/store.mjs', import.meta.url).href)};\ntry { admitJob(process.argv[1], JSON.parse(process.argv[2])); process.exit(0); } catch (error) { process.exit(error.code === 'EEXIST' ? 2 : 3); }`;
+  const submit = () => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ['--input-type=module', '-e', script, dir, JSON.stringify({ ...input, name: 'act.rock.8' })]);
+    child.on('error', reject);
+    child.on('exit', resolve);
+  });
+  const exits = await Promise.all(Array.from({ length: 4 }, submit));
+  assert.deepEqual(exits.sort(), [0, 2, 2, 2]);
+  assert.equal(listJobs(dir).length, 1);
+});
+
+test('simultaneous admissions cannot claim the same name and UUID-only jobs remain readable', async t => {
+  const { dir, input } = fixture(t);
+  const legacy = admitJob(dir, input);
+  assert.equal(getJob(dir, legacy.id).name, undefined);
+  const results = await Promise.allSettled(Array.from({ length: 12 }, () => new Promise(resolve => setImmediate(resolve)).then(() => admitJob(dir, { ...input, name: 'act.rock.3' }))));
+  assert.equal(results.filter(result => result.status === 'fulfilled').length, 1);
+  assert.equal(results.filter(result => result.status === 'rejected' && result.reason.code === 'EEXIST').length, 11);
+  assert.equal(listJobs(dir).length, 2);
 });

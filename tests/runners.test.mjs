@@ -244,3 +244,119 @@ test('group and router retain bounded nested child error and failed child identi
     return true;
   });
 });
+
+const events = (reason = 'stop', message = 'done', prefix = []) => ({ code: 0, output: [
+  ...prefix.map(event => JSON.stringify(event)),
+  JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: reason,
+    ...(reason === 'error' ? { errorMessage: message } : {}), content: [{ type: 'text', text: message }] } }),
+  JSON.stringify({ type: 'agent_settled' }),
+].join('\n') });
+
+const scoped = { model: 'alpha/one', defaultModel: 'alpha/one', scopedModels: ['alpha/one', 'beta/two', 'gamma/three', 'delta/four'] };
+const availableModels = ['alpha/one', 'beta/two', 'gamma/three', 'delta/four'];
+
+test('pre-tool provider failure tries scoped models once each and preserves agent definition', async () => {
+  const calls = [], logs = [];
+  const runners = createRunners({ availableModels, definitions: { reviewer: { model: 'alpha/one', prompt: 'Review safely', tools: 'read' } },
+    invoke: async (_command, args) => { calls.push(args); return calls.length === 1 ? events('error', 'provider unavailable') : events(); } });
+  const result = await runners.agent(job('agent', 'work', { name: 'reviewer', scopedModels: scoped.scopedModels }), { ...ctx(), emit: text => logs.push(text) });
+  assert.deepEqual(calls.map(args => args[args.indexOf('--model') + 1]), ['alpha/one', 'beta/two']);
+  assert.ok(calls.every(args => args.includes('Review safely') && args.includes('read')));
+  assert.deepEqual(result.attemptedModels, ['alpha/one', 'beta/two']);
+  assert.match(logs.join(''), /Model attempt: beta\/two/);
+});
+
+test('fallback exhausts at three distinct attempts and reports their names', async () => {
+  const calls = [];
+  const runners = createRunners({ availableModels, invoke: async (_command, args) => { calls.push(args[args.indexOf('--model') + 1]); return events('error', 'unavailable'); } });
+  await assert.rejects(runners.agent(job('agent', 'work', scoped), ctx()), /attempted models: alpha\/one, beta\/two, gamma\/three/);
+  assert.deepEqual(calls, ['alpha/one', 'beta/two', 'gamma/three']);
+});
+
+test('explicit unknown model does not invoke any candidate', async () => {
+  let calls = 0;
+  await assert.rejects(createRunners({ availableModels, invoke: async () => { calls++; return events(); } })
+    .agent(job('agent', 'work', { ...scoped, model: 'missing/model' }), ctx()), /unknown model: missing\/model/);
+  assert.equal(calls, 0);
+});
+
+test('post-tool provider error, cancellation and ambiguous streams do not fail over', async () => {
+  for (const result of [
+    events('error', 'provider unavailable', [{ type: 'tool_execution_start', toolCallId: 'x', toolName: 'bash' }]),
+    events('aborted', 'cancelled'),
+    { code: 0, output: '{invalid\n' + events('error', 'provider unavailable').output },
+    { code: 0, output: JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'provider unavailable' } }) },
+    events('stop', 'semantic task failure'),
+  ]) {
+    let calls = 0;
+    const runner = createRunners({ availableModels, invoke: async () => { calls++; return result; } });
+    if (result.output.includes('semantic task failure')) assert.equal((await runner.agent(job('agent', 'work', scoped), ctx())).summary, 'semantic task failure');
+    else await assert.rejects(runner.agent(job('agent', 'work', scoped), ctx()));
+    assert.equal(calls, 1);
+  }
+  const controller = new AbortController(); controller.abort();
+  let calls = 0;
+  await assert.rejects(createRunners({ availableModels, invoke: async () => { calls++; return events(); } })
+    .agent(job('agent', 'work', scoped), ctx(controller.signal)), /cancelled/);
+  assert.equal(calls, 0);
+});
+
+test('incremental JSON parser retains completion beyond 1MiB bounded output log', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-json-stream-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const script = join(root, 'pi-mock');
+  writeFileSync(script, `#!/usr/bin/env node\nconst message = 'x'.repeat(1100000);\nconsole.log(JSON.stringify({type:'message_end',message:{role:'assistant',stopReason:'stop',content:[{type:'text',text:message}]}}));\nconsole.log(JSON.stringify({type:'agent_settled'}));\n`);
+  const { chmodSync } = await import('node:fs'); chmodSync(script, 0o755);
+  const log = [];
+  const result = await createRunners({ piCommand: script }).agent(job('agent'), { ...ctx(), emit: text => log.push(text) });
+  assert.equal(result.summary.length, 1100000);
+});
+
+test('post-tool failures and ambiguous completions are marked uncertain without fallback', async () => {
+  const started = { type: 'tool_execution_start', toolCallId: 'call-1', toolName: 'bash' };
+  for (const result of [
+    events('error', 'provider unavailable', [started]),
+    { code: 0, output: JSON.stringify(started) + '\n{broken\n' + events('error', 'provider unavailable').output },
+    { code: 0, output: JSON.stringify(started) + '\n' + JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'error' } }) },
+    { ...events('error', 'provider unavailable', [started]), code: 1 },
+    { code: 0, output: '{broken\n' + events('error', 'provider unavailable').output },
+    { ...events('error', 'provider unavailable'), code: 1 },
+  ]) {
+    let calls = 0;
+    const runner = createRunners({ availableModels, invoke: async () => { calls++; return result; } });
+    await assert.rejects(runner.agent(job('agent', 'work', scoped), ctx()), error => error.uncertain === true);
+    assert.equal(calls, 1);
+  }
+  let calls = 0;
+  const runner = createRunners({ availableModels, invoke: async () => { calls++; return events('error', 'provider unavailable'); } });
+  await assert.rejects(runner.agent(job('agent', 'work', { model: 'alpha/one' }), ctx()), error => error.uncertain !== true);
+  assert.equal(calls, 1);
+});
+
+test('unrecorded default runs before scoped candidates and abort during invocation never retries', async () => {
+  const attempted = [];
+  const runner = createRunners({ availableModels, invoke: async (_command, args) => {
+    attempted.push(args.includes('--model') ? args[args.indexOf('--model') + 1] : '(default)');
+    return attempted.length === 1 ? events('error', 'provider unavailable') : events();
+  } });
+  assert.equal((await runner.agent(job('agent', 'work', { scopedModels: scoped.scopedModels }), ctx())).summary, 'done');
+  assert.deepEqual(attempted, ['(default)', 'alpha/one']);
+  const controller = new AbortController();
+  let calls = 0;
+  const cancelled = createRunners({ availableModels, invoke: async () => { calls++; controller.abort(); return events('error', 'provider unavailable'); } });
+  await assert.rejects(cancelled.agent(job('agent', 'work', scoped), ctx(controller.signal)));
+  assert.equal(calls, 1);
+});
+
+test('worker identity uses job label metadata without replacing explicit agent definition selection', async () => {
+  const calls = [];
+  const runners = createRunners({ definitions: { reviewer: { prompt: 'Review carefully' } }, invoke: async (_cmd, args, config) => {
+    calls.push({ args, config });
+    return { code: 0, output: '{"type":"agent_settled"}', stream: { settled: true, assistant: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'reviewed' }] } } };
+  } });
+  const work = job('agent', 'check', { name: 'reviewer' });
+  work.name = 'act.rock.4';
+  await runners.agent(work, { ...ctx(), storeDir: '/tmp/wrk' });
+  assert.equal(calls[0].config.env.PI_WRK_JOB_NAME, 'act.rock.4');
+  assert.ok(calls[0].args.includes('Review carefully'));
+});

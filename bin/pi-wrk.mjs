@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 import { isAbsolute, resolve } from 'node:path';
 import { runWorker } from '../src/worker.mjs';
-import { storePath, listJobs, getJob, readJobOutput, requestCancel } from '../src/store.mjs';
+import { storePath, listJobs, getJob, readJobOutput, requestCancel, resolveJobId } from '../src/store.mjs';
 
 async function main(args) {
   const command = args.shift() ?? 'jobs';
@@ -24,14 +24,21 @@ async function main(args) {
   }
   if (command === 'jobs') {
     if (args.length) throw new Error('usage: jobs [--store <path>]');
-    for (const job of listJobs(storeDir)) console.log(`${job.id} ${job.status} ${job.request.runner} ${job.request.lifetime} ${job.summary ?? job.error ?? ''}`);
+    for (const job of listJobs(storeDir)) console.log(`${job.name ? `${job.name} ` : ''}${job.id} ${job.status} ${job.request.runner} ${job.request.lifetime} ${job.summary ?? job.error ?? ''}`);
     return;
   }
   if (!['status', 'output', 'cancel'].includes(command) || args.length !== 1) throw new Error('usage: jobs|status <id>|output <id>|cancel <id> [--store <path>]');
-  const job = getJob(storeDir, args[0]);
+  const id = resolveJobId(storeDir, args[0]);
+  const job = getJob(storeDir, id);
+  if (args[0] !== id && !['queued', 'running', 'routing', 'uncertain'].includes(job.status)) throw new Error(`no active job named ${args[0]}`);
   if (command === 'status') console.log(JSON.stringify(job, null, 2));
   if (command === 'output') process.stdout.write(readJobOutput(storeDir, job.id));
-  if (command === 'cancel') { requestCancel(storeDir, job.id); console.log(`${job.id}: cancellation requested`); }
+  if (command === 'cancel') {
+    if (job.request.runner === 'btw' && job.status === 'running')
+      throw new Error('Cannot cancel in-flight BTW query; wait for the side conversation or close its session');
+    requestCancel(storeDir, job.id, args[0] !== id ? args[0] : undefined);
+    console.log(`${job.id}: cancellation requested`);
+  }
 }
 
 main(process.argv.slice(2)).catch(error => { console.error(error.message); process.exitCode = 1; });
