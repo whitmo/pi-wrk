@@ -43,6 +43,29 @@ settings or reload a running session.
   their submitting session ends; independent lifetime is not supported.
   In-flight BTW queries cannot be cancelled individually; wait for the
   answer or close the session.
+- `@@7 <message>` in a comment (`// @@7 ...`, `# @@7 ...`) in a Git-changed work file is checked on the **next agent turn**, not while idle. Staged, unstaged and untracked added comment lines qualify; unchanged old markers do not. `/wrk at7 scan --all` deliberately includes old comments across tracked and untracked (not ignored) files. The same source/location/text is sent once per Pi session, including after reload.
+  Eligible Zellij tabs are those successful Pi-mediated calls identify
+  as created or visited by name (including named `zellij_open_terminal`
+  / `zellij_start_pi` tab results), or those you explicitly register
+  with `/wrk at7 tab <name>`; an existing tab is baselined first. Merely
+  switching focus does not register a tab. Visible `@@7 <message>` lines
+  count, but shell commands mentioning the marker do not; output that
+  scrolls away before the next turn cannot be recovered. No idle wake is
+  added. A background triager answers in the Pi transcript without
+  starting a turn, or commits independent reversible changes in its own
+  worktree; results survive a same-session reload. A clean completed
+  worktree is removed; its branch is retained only when it has triage
+  commits. Dirty worktrees are retained for inspection. Requests
+  concerning the owner's dirty files are handed back for the owner to
+  edit. Check `/wrk status <id>` for the full job. Markers are not
+  approval for external or irreversible actions.
+- `/watch:zellij <tab name>`: in this Pi agent's Zellij session,
+  snapshot the named tab and wake this agent once when its terminal
+  viewport changes, including changes before the first poll. Requires
+  `ZELLIJ_SESSION_NAME` and `ZELLIJ_PANE_ID`; the agent's own tab cannot
+  be watched. It does not capture every output byte or survive a
+  session switch, shutdown, or extension reload. Starting another watch
+  replaces the previous one. Other watch sources are not supported yet.
 - `/& todo`: blocked until a real shared todo-provider adapter is wired.
   No task-provider bridge has been confirmed.
 - `/wrk` or `/wrk jobs`: list jobs and their names. `/wrk queues` lists
