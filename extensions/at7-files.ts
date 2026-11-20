@@ -3,14 +3,29 @@ import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { promisify } from 'node:util';
 
-export type At7Message = { key: string; source: 'file' | 'zellij'; location: string; text: string };
+export type At7Message = { key: string; source: 'file' | 'zellij'; location: string; text: string; recipient?: string; claimedBy?: string; author?: string };
 const exec = promisify(execFile);
-const marker = /^\s*(?:#|\/\/|--|\/\*|\*|<!--)\s*@@7(?:\s+)(.+?)\s*(?:\*\/|-->)?\s*$/;
+const marker = /^\s*(?:#|\/\/|--|\/\*|\*|<!--)\s*@@7(?=\s|:[@+:])(.+?)\s*(?:\*\/|-->)?\s*$/;
 
 export function message(source: At7Message['source'], location: string, line: string): At7Message | undefined {
-  const text = (source === 'zellij' ? /^\s*@@7\s+(.+?)\s*$/.exec(line)?.[1] : undefined) ?? marker.exec(line)?.[1]?.trim();
+  const raw = (source === 'zellij' ? /^\s*@@7\s+(.+?)\s*$/.exec(line)?.[1] : undefined) ?? marker.exec(line)?.[1];
+  const text = source === 'file' && raw?.startsWith(':') ? `@@7${raw.trim()}` : raw?.trim();
   if (!text) return undefined;
-  return { source, location, text, key: JSON.stringify([source, location, text]) };
+  const item: At7Message = { source, location, text, key: JSON.stringify([source, location, text]) };
+  if (source === 'file') {
+    let rest = text;
+    while (rest.startsWith('@@7:')) {
+      const tag = /^@@7:([@+:])([^\s]+)(?:\s+|$)/.exec(rest);
+      if (!tag || !/^[\w.#-]+$/.test(tag[2])) return undefined;
+      const field = tag[1] === '@' ? 'recipient' : tag[1] === '+' ? 'author' : 'claimedBy';
+      if (item[field]) return undefined;
+      item[field] = tag[2];
+      rest = rest.slice(tag[0].length);
+    }
+    if (!rest.trim()) return undefined;
+    if (rest !== text) item.text = rest.trim();
+  }
+  return item;
 }
 
 export async function collectFileMessages(root: string, scope: 'changed' | 'all', seen: ReadonlySet<string>): Promise<At7Message[]> {
