@@ -29,6 +29,18 @@ settings or reload a running session.
   a clean Git checkout; children commit on separate worktree branches and
   one integration worktree combines their commits. The submitting checkout
   stays unchanged. Conflicts and all worktrees are retained for inspection.
+  The planner must return exactly two nonempty JSON strings (for example,
+  `["Assess security", "Assess maintainability"]`), not objects. An invalid
+  shape gets one corrective planning call before any children or workspaces;
+  child execution is never automatically retried. Named reviewers or models
+  in prompt prose are not executable selectors; selecting four reviewers is
+  a separate feature. Before retrying a failed job, inspect the parent error
+  for the child ID, status and underlying cause (and retained worktree paths).
+- `/wrk btw <question>`: send a question to the current session's BTW side
+  thread without switching focus. Requires pi-btw; completion and errors
+  appear under `/wrk status <id>`, and `/wrk output <id>` shows the answer.
+  Open `/btw` to follow up in the same side conversation. BTW jobs end when
+  their submitting session ends; independent lifetime is not supported.
 - `/& todo`: blocked until a real shared todo-provider adapter is wired.
   No task-provider bridge has been confirmed.
 - `/wrk` or `/wrk jobs`: list jobs. `/wrk queues` lists persistent queue

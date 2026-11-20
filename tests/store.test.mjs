@@ -36,6 +36,15 @@ test('admission persists YAML with private permissions and exclusive UUID identi
   assert.equal(readdirSync(join(dir, 'jobs')).length, 2);
 });
 
+test('local BTW jobs are admitted running atomically and ordinary jobs stay queued', t => {
+  const { dir, input } = fixture(t);
+  const request = { ...input.request, runner: 'btw', prompt: 'ask BTW' };
+  const btw = admitJob(dir, { ...input, request, initialStatus: 'running' });
+  assert.equal(getJob(dir, btw.id).status, 'running');
+  assert.equal(admitJob(dir, input).status, 'queued');
+  assert.throws(() => admitJob(dir, { ...input, initialStatus: 'running' }), /initial status/i);
+});
+
 test('queue definitions survive jobs and reject path-like queue names', t => {
   const { dir, input } = fixture(t);
   const job = admitJob(dir, { ...input, request: { ...input.request, queue: 'review' } });

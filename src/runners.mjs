@@ -9,6 +9,22 @@ import { formatFocus, normalizeFocus } from './focus.mjs';
 
 const CAP = 1024 * 1024;
 const abortError = () => new Error('job cancelled');
+const assignmentExample = '["Assess security", "Assess maintainability"]';
+
+function assignmentError(proposal) {
+  let assignments;
+  try { assignments = JSON.parse(proposal); } catch { return 'malformed JSON'; }
+  if (!Array.isArray(assignments) || assignments.length !== 2) return 'expected exactly two items';
+  if (assignments.some(item => typeof item !== 'string')) return 'items must be strings, not objects or other values';
+  if (assignments.some(item => !item.trim())) return 'items must be nonempty, nonblank strings';
+  return null;
+}
+
+function childFailure(child, result) {
+  const detail = result.error || result.summary || '';
+  const bounded = typeof detail === 'string' ? detail.replace(/\s+/g, ' ').trim().slice(0, 240) : '';
+  return `${String(child.id).slice(0, 80)} (${result.status})${bounded ? `: ${bounded}` : ''}`;
+}
 
 function processRun(command, args, { cwd, signal, emit = () => {}, env }) {
   return new Promise((resolve, reject) => {
@@ -126,19 +142,26 @@ export function createRunners({ piCommand = 'pi', definitions, availableModels, 
   }
   async function group(job, context, kind) {
     const council = kind === 'council';
-    const proposal = await ask(job, context, council
-      ? 'Return ONLY a JSON array of two different assessment perspectives. No markdown.'
-      : 'Return ONLY a JSON array of two independent, bounded assignments. No markdown.');
-    let assignments;
-    try { assignments = JSON.parse(proposal); } catch { throw new Error(`invalid ${kind} assignments`); }
-    if (!Array.isArray(assignments) || assignments.length !== 2 || assignments.some(p => typeof p !== 'string' || !p.trim())) throw new Error(`invalid ${kind} assignments`);
+    const instruction = `Return ONLY a JSON array of exactly two nonempty JSON STRING items (no objects or markdown), e.g. ${assignmentExample}. ${council ? 'Give two different assessment perspectives.' : 'Give two independent, bounded assignments.'}`;
+    let proposal = await ask(job, context, instruction);
+    let reason = assignmentError(proposal);
+    if (reason) {
+      if (context.signal?.aborted) throw abortError();
+      proposal = await ask(job, context, `${instruction} Your previous response had an invalid shape: ${reason}. Repeat the original task using only the required JSON string array.`);
+      if (context.signal?.aborted) throw abortError();
+      reason = assignmentError(proposal);
+      if (reason) throw new Error(`invalid ${kind} assignments after one correction: ${reason}`);
+    }
+    if (context.signal?.aborted) throw abortError();
+    const assignments = JSON.parse(proposal);
     const spaces = council ? null : context.createWorkspaces();
     const children = assignments.map((prompt, index) => context.submitChild({ runner: 'agent',
       prompt: council ? `Read-only assessment (${prompt}): ${job.request.prompt}` : prompt,
       options: council ? { tools: 'read,grep,find,ls' } : { systemInstruction: 'Work only in this isolated Git worktree. Commit only your own changes using git -c commit.gpgsign=false commit. Never change the main branch or other worktrees. Report if you made no commits.' },
     }, spaces?.children[index]));
     const results = await Promise.all(children.map(child => context.getChild(child.id)));
-    if (results.some(result => result.status !== 'succeeded')) throw new Error(`${kind} child failed or cancelled${spaces ? `; retained integration ${spaces.integration.branch} at ${spaces.integration.projectRoot}; children ${spaces.children.map(c => `${c.branch} at ${c.projectRoot}`).join(', ')}` : ''}`);
+    const failures = results.flatMap((result, index) => result.status === 'succeeded' ? [] : [childFailure(children[index], result)]);
+    if (failures.length) throw new Error(`${kind} child failed or cancelled: ${failures.join('; ')}${spaces ? `; retained integration ${spaces.integration.branch} at ${spaces.integration.projectRoot}; children ${spaces.children.map(c => `${c.branch} at ${c.projectRoot}`).join(', ')}` : ''}`);
     const report = spaces ? integrateSwarm(spaces) : '';
     const summary = await ask(job, context, `Synthesize these independent ${kind} results. Do not claim unfinished work succeeded.\n${results.map(r => r.summary).join('\n---\n')}\n${report}`);
     return { summary: `${summary}${report ? `\n${report}` : ''}` };
@@ -159,7 +182,7 @@ export function createRunners({ piCommand = 'pi', definitions, availableModels, 
       if (!['agent', 'council', 'swarm'].includes(route)) throw new Error('invalid route');
       const child = context.submitChild({ runner: route, prompt: job.request.prompt, options: job.request.options });
       const result = await context.getChild(child.id);
-      if (result.status !== 'succeeded') throw new Error(`routed child ${result.status}`);
+      if (result.status !== 'succeeded') throw new Error(`routed child ${childFailure(child, result)}`);
       return { summary: result.summary };
     },
     council: (job, context) => group(job, context, 'council'),

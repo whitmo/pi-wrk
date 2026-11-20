@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync, utimesSync, existsSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, utimesSync, existsSync, readFileSync } from 'node:fs';
 import { admitJob, getJob, readJobOutput, requestCancel, touchOwner } from '../src/store.mjs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -115,6 +115,32 @@ test('restart holds unknown active mutation and prevents newly queued work', asy
     await new Promise(resolve => setTimeout(resolve, 30));
     assert.equal(f.items.get('new').status, 'queued');
     assert.equal(calls, 0);
+  } finally { await worker.stop(); }
+});
+
+test('worker leaves session-owned BTW jobs to the Pi extension', async () => {
+  const f = fixture([
+    { id: 'btw-live', status: 'running', request: { runner: 'btw', lifetime: 'session' } },
+    { id: 'btw-orphan', status: 'queued', request: { runner: 'btw', lifetime: 'session' } },
+    { id: 'normal' },
+  ]);
+  let calls = 0;
+  const worker = await running(f, { agent: async () => { calls++; return {}; } });
+  try {
+    await until(() => f.items.get('normal').status === 'succeeded');
+    await until(() => f.items.get('btw-orphan').status === 'failed');
+    assert.equal(f.items.get('btw-live').status, 'running');
+    assert.equal(calls, 1);
+  } finally { await worker.stop(); }
+});
+
+test('worker fails session-owned BTW jobs when the owning Pi session expires', async () => {
+  const f = fixture([{ id: 'btw-live', status: 'running', request: { runner: 'btw', lifetime: 'session' } }]);
+  f.store.ownerAlive = () => false;
+  const worker = await running(f, {});
+  try {
+    await until(() => f.items.get('btw-live').status === 'failed');
+    assert.match(f.items.get('btw-live').error, /session.*ended/i);
   } finally { await worker.stop(); }
 });
 
@@ -334,13 +360,15 @@ test('notice failure cannot overwrite successful runner outcome', async () => {
 
 test('detached worker waits out a recent unverifiable lock and becomes ready', async () => {
   const temp = mkdtempSync(join(tmpdir(), 'wrk-restart-'));
-  const lock = join(temp, 'worker.lock');
+  const storeDir = join(temp, 'store');
+  mkdirSync(storeDir);
+  const lock = join(storeDir, 'worker.lock');
   writeFileSync(lock, 'pid: 999999\ntoken: old-unverified\nstartedAt: 1\n');
   const old = new Date(Date.now() - 9600);
   utimesSync(lock, old, old);
   let child;
   try {
-    await ensureWorker(temp, { timeoutMs: 4500, spawnWorker: (command, args, options) => {
+    await ensureWorker(storeDir, { timeoutMs: 4500, spawnWorker: (command, args, options) => {
       child = spawn(command, args, options);
       return child;
     } });
