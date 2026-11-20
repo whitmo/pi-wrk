@@ -6,10 +6,11 @@ import {
 import { randomUUID } from 'node:crypto';
 import { join, resolve, isAbsolute, dirname } from 'node:path';
 import { parseDocument, stringify } from 'yaml';
+import { normalizeFocus } from './focus.mjs';
 
 const UUID = /^[\da-f]{8}-[\da-f]{4}-[1-8][\da-f]{3}-[89ab][\da-f]{3}-[\da-f]{12}$/i;
 const OWNER = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
-const IMMUTABLE = new Set(['id', 'request', 'ownerId', 'projectRoot', 'cwd', 'createdAt', 'parentId', 'lifetime', 'queue']);
+const IMMUTABLE = new Set(['id', 'request', 'ownerId', 'projectRoot', 'cwd', 'createdAt', 'parentId', 'lifetime', 'queue', 'focus']);
 const OUTPUT_LIMIT = 1_048_576;
 const QUEUE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/;
 
@@ -140,9 +141,10 @@ export function storePath(projectRoot) {
   return join(resolve(projectRoot), '.agents', 'wrk');
 }
 
-export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, handoff, parentId } = {}) {
+export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, handoff, parentId, focus } = {}) {
   ownerId(owner);
-  if (parentId !== undefined) existingJob(storeDir, jobId(parentId));
+  const parent = parentId !== undefined ? existingJob(storeDir, jobId(parentId)) : undefined;
+  focus = normalizeFocus(parent ? parent.focus : focus);
   if (!isAbsolute(projectRoot ?? '') || !isAbsolute(cwd ?? '')) throw new Error('project root and cwd must be absolute');
   safeData(request);
   if (!request || typeof request !== 'object' || Array.isArray(request) || typeof request.runner !== 'string' ||
@@ -165,6 +167,7 @@ export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, 
     const id = randomUUID();
     const job = { id, request, ownerId: owner, projectRoot: resolve(projectRoot), cwd: resolve(cwd),
       status: 'queued', createdAt: now, updatedAt: now };
+    if (focus !== undefined) job.focus = focus;
     if (handoff !== undefined) job.handoff = handoff;
     if (parentId !== undefined) job.parentId = parentId;
     try { atomic(join(jobs, `${id}.yaml`), job, { exclusive: true }); return job; }

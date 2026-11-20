@@ -20,6 +20,37 @@ main or the submitting branch. Conflicts retain the unresolved worktree;
 inspect the job error and its retained paths. Worktrees are not removed
 automatically.
 
+## Focus awareness
+
+Context-only inheritance is on by default when the submitting branch has
+an active pi-focus v1 binding. Each job retains an immutable snapshot;
+clearing or switching the parent's focus does not retarget queued work.
+Children inherit their parent's snapshot, not a focus inferred from the
+worker process or another checkout. `--focus none` opts out per job.
+
+Full activation requires explicit `--focus active` and a trusted absolute
+`PI_WRK_FOCUS_EXTENSION` path in the submitting process. Use the pi-focus
+main entry with its adjacent v1 `focus-session.mjs`. The worker checks
+compatibility before invoking Pi. The dedicated child adapter seeds a new
+local binding with the child's session identity, then lets pi-focus resume
+that snapshot. Its focus event handlers use the source cwd; built-in tools
+still operate in the child's cwd. Initialization failures terminate the
+child rather than allowing a model to run without the requested binding.
+
+Focus source paths refer to the submitting filesystem. This is local
+execution, not a portable export to another machine. Context-only mode
+never loads activation declarations. Active mode may enforce the chosen
+focus's tool guard, but does not load unrelated extensions or invoke
+presets/runbooks. Keep the configured extension and its dependencies
+installed while jobs are queued. Workers do not hot-reload: use one launched
+from this revision, not an older worker that ignores the new focus field.
+
+An offline probe with the installed Pi CLI and pi-focus extension restored
+a synthetic captured binding, received a successful resume acknowledgement
+and registered `focus_create`. No prompt or model request was sent. This
+proves startup integration, not authenticated agent execution or live TUI
+behavior; those limits below still apply.
+
 ## Cancellation and recovery are incomplete
 
 Cancellation requests signal the original process group. A descendant can

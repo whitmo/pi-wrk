@@ -7,6 +7,9 @@ import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { createSwarmWorkspaces } from '../src/workspaces.mjs';
 
+import { captureFocus } from '../src/focus.mjs';
+import { entry } from './fixtures/focus.mjs';
+
 const job = (runner, prompt = 'work', options = {}) => ({ id: 'job', cwd: process.cwd(), projectRoot: process.cwd(), request: { runner, prompt, options } });
 const ctx = (signal = new AbortController().signal) => ({ signal, emit: () => {} });
 
@@ -61,6 +64,28 @@ test('agent explicitly loads only trusted message tool and passes scoped executi
   assert.equal(call.args.at(-1), 'exact task');
 });
 
+test('agent gets captured context without enabling focus extension or changing task', async () => {
+  let call;
+  const invoke = async (_command, args, config) => {
+    call = { args, config };
+    return { code: 0, output: JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'done' }] } }) + '\n' + JSON.stringify({ type: 'agent_settled' }) };
+  };
+  const focus = captureFocus([entry()], '/source', '/source/src');
+  await createRunners({ invoke }).agent({ ...job('agent', 'exact task'), cwd: '/worktree', focus }, ctx());
+  assert.ok(call.args.includes('--no-extensions'));
+  assert.ok(!call.args.some(arg => arg.endsWith('runner-focus.ts')));
+  assert.match(call.args[call.args.indexOf('--append-system-prompt') + 1], /Ship small changes/);
+  assert.match(call.args[call.args.indexOf('--append-system-prompt') + 1], /\/source\/\.agents\/focus/);
+  assert.equal(call.args.at(-1), 'exact task');
+});
+
+test('missing active focus extension fails before invoking Pi', async () => {
+  let calls = 0;
+  const focus = { ...captureFocus([entry()], '/source', '/source'), mode: 'active', extensionPath: '/missing/index.ts' };
+  await assert.rejects(createRunners({ invoke: async () => { calls++; } }).agent({ ...job('agent'), focus }, ctx()), /unavailable/i);
+  assert.equal(calls, 0);
+});
+
 test('router selects only a valid pattern, not unvalidated prose', async () => {
   const runners = createRunners({ invoke: async () => ({ code: 0, output: JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'shell' }] } }) + '\n' + JSON.stringify({ type: 'agent_settled' }) + '\n' }) });
   await assert.rejects(runners.router(job('router'), ctx()), /invalid route/i);
@@ -71,8 +96,12 @@ test('council uses separate read-only child assessments and synthesis', async ()
   const children = [];
   const context = { ...ctx(), submitChild: request => { prompts.push(request.prompt); const child = { id: `child-${prompts.length}` }; children.push(child); return child; }, getChild: async id => ({ status: 'succeeded', summary: `result from ${id}` }) };
   const invoke = async (_command, args) => ({ code: 0, output: JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: args.at(-1).includes('Synthesize') ? 'combined' : '["part one", "part two"]' }] } }) + '\n' + JSON.stringify({ type: 'agent_settled' }) + '\n' });
-  const runners = createRunners({ invoke });
-  assert.equal((await runners.council(job('council'), context)).summary, 'combined');
+  const runners = createRunners({ invoke: async (command, args, config) => {
+    assert.match(args[args.indexOf('--append-system-prompt') + 1], /Ship small changes/);
+    return invoke(command, args, config);
+  } });
+  const focusedJob = { ...job('council'), focus: captureFocus([entry()], '/source', '/source') };
+  assert.equal((await runners.council(focusedJob, context)).summary, 'combined');
   assert.equal(prompts.length, 2);
 });
 

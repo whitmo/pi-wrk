@@ -42,6 +42,31 @@ async function until(predicate, timeoutMs = 500) {
   assert.fail('worker did not reach expected state');
 }
 
+test('nested router/council children inherit exact focus snapshot across workspace changes', async () => {
+  const { captureFocus } = await import('../src/focus.mjs');
+  const { entry } = await import('./fixtures/focus.mjs');
+  const focus = captureFocus([entry()], '/source', '/source/src');
+  const f = fixture([{ id: 'router', focus, request: { runner: 'router' } }]);
+  const seen = [];
+  const worker = await running(f, {
+    router: async (job, context) => {
+      const child = context.submitChild({ runner: 'council', prompt: 'assess', options: {} });
+      return { summary: (await context.getChild(child.id)).summary };
+    },
+    council: async (job, context) => {
+      seen.push(job.focus);
+      const child = context.submitChild({ runner: 'agent', prompt: 'read', options: {} });
+      return { summary: (await context.getChild(child.id)).summary };
+    },
+    agent: async job => { seen.push(job.focus); return { summary: 'done' }; },
+  });
+  try {
+    await until(() => f.items.get('router').status === 'succeeded');
+    assert.equal(seen.length, 2);
+    for (const snapshot of seen) assert.deepEqual(snapshot, focus);
+  } finally { await worker.stop(); }
+});
+
 test('queue is FIFO and one at a time while other queue progresses', async () => {
   const f = fixture([{ id: 'a', request: { runner: 'agent', queue: 'serial' } }, { id: 'b', request: { runner: 'agent', queue: 'serial' } }, { id: 'c', request: { runner: 'agent' } }]);
   let release;
@@ -233,7 +258,10 @@ test('swarm child jobs retain their own cwd, projectRoot and branch; arbitrary w
   git('config', 'user.email', 'test@example.invalid'); git('config', 'user.name', 'Test');
   writeFileSync(join(temp, '.gitignore'), '.agents/\n'); git('add', '.gitignore'); git('commit', '-qm', 'base');
   const dir = join(temp, '.agents', 'wrk');
-  const parent = admitJob(dir, { ownerId: 'owner', projectRoot: temp, cwd: temp,
+  const { captureFocus } = await import('../src/focus.mjs');
+  const { entry } = await import('./fixtures/focus.mjs');
+  const focus = captureFocus([entry()], temp, temp);
+  const parent = admitJob(dir, { ownerId: 'owner', projectRoot: temp, cwd: temp, focus,
     request: { runner: 'swarm', prompt: 'work', options: {}, lifetime: 'independent', queue: null } });
   const controller = new AbortController();
   const running = runWorker({ storeDir: dir, pollMs: 5, concurrency: 1, signal: controller.signal, runners: {
@@ -249,6 +277,8 @@ test('swarm child jobs retain their own cwd, projectRoot and branch; arbitrary w
       assert.match(job.workspace.branch, /^wrk\/child-/);
       assert.equal(job.cwd, job.projectRoot);
       assert.equal(job.workspace.path, job.projectRoot);
+      assert.deepEqual(job.focus, focus);
+      assert.equal(job.focus.sourceRoot, temp);
       return { summary: 'part complete' };
     },
   } });
