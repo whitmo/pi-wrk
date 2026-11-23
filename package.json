@@ -8,7 +8,8 @@
     "node": ">=22"
   },
   "bin": {
-    "pi-wrk": "./bin/pi-wrk.mjs"
+    "pi-wrk": "./bin/pi-wrk.mjs",
+    "send-to-pi": "./bin/send-to-pi.mjs"
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
