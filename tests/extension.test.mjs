@@ -5,11 +5,13 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as store from '../src/store.mjs';
+import { parseRequest } from '../src/request.mjs';
 
 const { createExtension } = await createJiti(import.meta.url).import('../extensions/index.ts');
 
 function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure, readZellijTab, zellijSessionName, zellijPaneId, collectFileMessages, initialBranch, sharedJobs, cleanupAt7Workspace, admissionFailure, delayTranscript = false, peerRegister } = {}) {
   const commands = new Map();
+  const tools = new Map();
   const events = new Map();
   const bus = new Map();
   const jobs = sharedJobs ?? new Map();
@@ -75,11 +77,11 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
     cleanupAt7Workspace: cleanupAt7Workspace ?? (() => true),
   };
   if (realStore) Object.assign(deps, store, { storePath: () => realStore });
-  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), on: (name, handler) => events.set(name, handler), events: { on: (name, handler) => bus.set(name, handler), emit: (name, payload) => { if (name === 'intercom:extension-register') peerRegister?.(payload); bus.get(name)?.(payload); } }, sendUserMessage: (message, options) => messages.push({ message, options }), appendEntry: (customType, data) => branch.push({ id: `entry-${branch.length}`, type: 'custom', customType, data }), sendMessage: (message, options) => { transcript.push({ message, options }); if (!delayTranscript) branch.push({ type: 'message', message: { role: 'custom', ...message } }); } };
+  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), registerTool: (config) => tools.set(config.name, config), on: (name, handler) => events.set(name, handler), events: { on: (name, handler) => bus.set(name, handler), emit: (name, payload) => { if (name === 'intercom:extension-register') peerRegister?.(payload); bus.get(name)?.(payload); } }, sendUserMessage: (message, options) => messages.push({ message, options }), appendEntry: (customType, data) => branch.push({ id: `entry-${branch.length}`, type: 'custom', customType, data }), sendMessage: (message, options) => { transcript.push({ message, options }); if (!delayTranscript) branch.push({ type: 'message', message: { role: 'custom', ...message } }); } };
   createExtension(pi, deps);
   const command = (name, input = '') => commands.get(name)(input, ctx);
   const event = (name, payload = {}, context = ctx) => events.get(name)?.(payload, context);
-  return { command, event, onBus: (name, handler) => bus.set(name, handler), ctx, jobs, ui, branch, notices, messages, transcript, tick: () => heartbeat?.(), tickWatch: async () => { watchTick?.(); await flush(); }, get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
+  return { command, event, tools, onBus: (name, handler) => bus.set(name, handler), ctx, jobs, ui, branch, notices, messages, transcript, tick: () => heartbeat?.(), tickWatch: async () => { watchTick?.(); await flush(); }, get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
 }
 
 
@@ -656,6 +658,47 @@ test('incompatible live worker prevents admission on command and inline input', 
   assert.deepEqual(await h.event('input', { text: 'check &', source: 'interactive' }), { action: 'handled' });
   assert.equal(h.jobs.size, 0);
   assert.equal(h.starts, 2);
+});
+
+test('skill command admits one durable job without involving the foreground', async () => {
+  const h = harness({ parser: parseRequest });
+  await h.event('session_start');
+  const result = await h.event('input', {
+    text: '/skill:wrk a:{name: ari} prepare a report',
+    source: 'interactive',
+  });
+  assert.deepEqual(result, { action: 'handled' });
+  assert.equal(h.jobs.size, 1);
+  assert.equal(h.jobs.get('job-1').request.options.name, 'ari');
+  assert.equal(h.jobs.get('job-1').request.prompt, 'prepare a report');
+  assert.equal(h.jobs.get('job-1').status, 'queued');
+  assert.equal(h.aborted, 0);
+  assert.equal(h.messages.length, 0);
+  assert.match(h.ui.at(-1).message, /job-1 queued/);
+});
+
+test('expanded skill can submit through an agent-callable admission tool', async () => {
+  const h = harness({ parser: parseRequest });
+  await h.event('session_start');
+  const admission = h.tools.get('wrk_submit');
+  assert.ok(admission, 'wrk_submit must be registered for the agent');
+  const result = await admission.execute('call-1', { input: 'a:{name: ari} prepare a report' }, undefined, undefined, h.ctx);
+  assert.equal(h.jobs.size, 1);
+  assert.equal(h.aborted, 0);
+  assert.match(result.content[0].text, /job-1.*queued/);
+  assert.equal(result.details.jobId, 'job-1');
+});
+
+test('skill admission failure reports the real worker error without inventing a job', async () => {
+  const h = harness({ parser: parseRequest, startup: () => Promise.reject(new Error('worker unavailable')) });
+  await h.event('session_start');
+  const result = await h.tools.get('wrk_submit').execute('call-1', { input: 'prepare a report' }, undefined, undefined, h.ctx);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Admission failed: worker unavailable/);
+  assert.equal(h.jobs.size, 0);
+  assert.deepEqual(await h.event('input', { text: '/skill:wrk prepare a report', source: 'interactive' }), { action: 'handled' });
+  assert.equal(h.jobs.size, 0);
+  assert.equal(h.aborted, 0);
 });
 
 test('/wrk routes inspection and cancellation without admitting another job', async () => {
