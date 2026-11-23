@@ -17,6 +17,10 @@ settings or reload a running session.
 
 ## Commands
 
+- `/skill:wrk <task>`: admit the raw task before skill expansion; if the
+  skill arrives already expanded, the agent calls `wrk_submit` with its task.
+  A receipt contains a durable job ID, not a completion result. An admission
+  error means no job was created; do not submit the same task again blindly.
 - `/bg <prompt>` or `/& bg <prompt>`: use a background agent.
 - `/& <prompt>` or `/wrk <prompt>`: route to an agent, council or swarm.
 - `/& a:{name: ari, model: provider/model} <prompt>`: explicit agent/model;
@@ -102,9 +106,18 @@ if the owner is absent. This is one-way delivery, not a reply channel.
 New jobs get unique `verb.noun.digit` names from
 `docs/sorted_short_words.csv`; unnamed worker agents inherit their job's
 name. Explicit agent definitions such as `a:{name: ari}` are unaffected.
-After reloading a new pi-wrk release, an older live worker is not reused or
-stopped automatically: wait for its jobs to drain, stop the old worker, then
-retry submission. This avoids interrupting active work.
+On a compatible worker-code update, admission starts a replacement and waits
+for its readiness before handing queued and new root jobs to it. The previous
+worker finishes active work (including workflow children) and exits after
+its drain; running jobs are never replayed. Named queues and scheduler slots
+are shared across generations. If replacement startup fails, pi-wrk reports
+`worker.log`, retries only confirmed-dead attempts a bounded number of times,
+and leaves the old worker serving. If its ownership cannot be verified, retry
+manually rather than killing a live worker. A pre-upgrade protocol-2/token-only
+worker cannot safely hand off: let its jobs drain, stop it by an operator-safe
+procedure, then retry. The first upgrade from that version is **not** seamless.
+A Pi extension reload preserves the same session's job lease; quitting or
+switching sessions still closes session-owned jobs.
 
 The default `session` lifetime ends with the submitting session's lease,
 including queued work. Prefix a request with `--lifetime independent` to

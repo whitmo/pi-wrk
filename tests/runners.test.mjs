@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createRunners } from '../src/runners.mjs';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
@@ -31,6 +31,39 @@ test('named agent and model fail if not installed', async () => {
   const runners = createRunners({ definitions: {}, availableModels: ['openai/test'] });
   await assert.rejects(runners.agent(job('agent', 'work', { name: 'unknown' }), ctx()), /unknown agent/i);
   await assert.rejects(runners.agent(job('agent', 'work', { model: 'missing/model' }), ctx()), /unknown model/i);
+});
+
+test('agent name resolves from configured Pi agent directory and filename', async () => {
+  const directory = mkdtempSync(join(tmpdir(), 'wrk-agents-'));
+  const before = process.env.PI_CODING_AGENT_DIR;
+  let called;
+  try {
+    mkdirSync(join(directory, 'agents'));
+    writeFileSync(join(directory, 'agents', 'ari.md'),
+      '---\nmodel: openai-codex/gpt-6-sol\ntools: read,grep\n---\nSolve the task.\n');
+    process.env.PI_CODING_AGENT_DIR = directory;
+    const invoke = async (_command, args) => {
+      called = args;
+      return { code: 0, output: [
+        JSON.stringify({ type: 'message_end', message: { role: 'assistant', stopReason: 'stop', content: [{ type: 'text', text: 'done' }] } }),
+        JSON.stringify({ type: 'agent_settled' }),
+      ].join('\n') };
+    };
+    await createRunners({ availableModels: ['openai-codex/gpt-6-sol'], invoke })
+      .agent(job('agent', 'work', { name: 'ari' }), ctx());
+    assert.equal(called[called.indexOf('--model') + 1], 'openai-codex/gpt-6-sol');
+    assert.equal(called[called.indexOf('--tools') + 1], 'read,grep');
+  } finally {
+    if (before === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = before;
+    rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('unsupported model shorthand fails with a configured-model lookup instruction', async () => {
+  const runners = createRunners({ definitions: {}, availableModels: ['openai-codex/gpt-6.2-sol'] });
+  await assert.rejects(runners.agent(job('agent', 'work', { model: 'sol-6.2' }), ctx()),
+    /unknown model: sol-6\.2.*pi --offline --list-models/);
 });
 
 test('agent parses JSON completion and rejects failed assistant despite exit zero', async () => {

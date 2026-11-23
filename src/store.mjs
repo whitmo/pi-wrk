@@ -255,7 +255,7 @@ export function listWorkerJobs(storeDir) {
       const job = existingJob(storeDir, id);
       if (!WORKER_STATUSES.has(job.status)) throw new Error(`corrupt job status: ${id}`);
       return job;
-    }).sort((a, b) => b.createdAt.localeCompare(a.createdAt) || b.id.localeCompare(a.id));
+    }).sort(newestFirst);
 }
 
 const sleep = new Int32Array(new SharedArrayBuffer(4));
@@ -287,6 +287,60 @@ export function claimQueuedJob(storeDir, id, { leaseMs = 15000, startStatus = 'r
     const next = { ...storedJob, status: startStatus, startedAt: new Date().toISOString(), updatedAt: new Date().toISOString() };
     atomic(location(storeDir, 'jobs', `${id}.yaml`), next);
     return next;
+  });
+}
+
+// Serialize cross-generation scheduling decisions, not just per-job claims.
+// A replacement and draining worker must see the same active queues and slots.
+function withScheduler(storeDir, action) {
+  const gate = join(base(storeDir), 'scheduler.lock');
+  let fd;
+  for (let tries = 0; tries < 2000; tries++) {
+    try { fd = openSync(gate, 'wx', 0o600); writeFileSync(fd, `${process.pid}\n`); break; }
+    catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      // Never steal a live process's scheduling decision, even when slow.
+      const pid = Number(readPrivate(gate)?.toString().trim());
+      if (Number.isSafeInteger(pid) && pid > 0) {
+        try { process.kill(pid, 0); } catch (problem) {
+          if (problem.code === 'ESRCH') { try { unlinkSync(gate); } catch (e) { if (e.code !== 'ENOENT') throw e; } }
+        }
+      }
+      Atomics.wait(sleep, 0, 0, 5);
+    }
+  }
+  if (fd === undefined) throw new Error('scheduler locked; retry later');
+  try { return action(); }
+  finally { closeSync(fd); unlinkSync(gate); }
+}
+
+export function reacquireSchedulerSlot(storeDir, id, concurrency) {
+  return withScheduler(storeDir, () => {
+    const jobs = listWorkerJobs(storeDir);
+    const current = existingJob(storeDir, id);
+    if (!['running', 'routing'].includes(current.status)) return false;
+    if (jobs.filter(job => job.id !== id && job.request.runner !== 'btw' &&
+      ['running', 'routing'].includes(job.status) && !job.waitingForChild).length >= concurrency) return false;
+    updateJob(storeDir, id, { waitingForChild: false });
+    return true;
+  });
+}
+
+export function claimScheduledJob(storeDir, id, { leaseMs = 15000, startStatus = 'running', concurrency = 3 } = {}) {
+  jobId(id);
+  return withScheduler(storeDir, () => {
+    const jobs = listWorkerJobs(storeDir);
+    if (jobs.some(job => job.status === 'uncertain')) return null;
+    const candidate = existingJob(storeDir, id);
+    if (candidate.status !== 'queued') return null;
+    const active = jobs.filter(job => job.request.runner !== 'btw' && ['running', 'routing'].includes(job.status));
+    if (active.filter(job => !job.waitingForChild).length >= concurrency) return null;
+    if (candidate.request.queue && active.some(job => job.request.queue === candidate.request.queue)) return null;
+    if (candidate.parentId) {
+      const parent = existingJob(storeDir, candidate.parentId);
+      if (!['running', 'routing'].includes(parent.status)) return null;
+    }
+    return claimQueuedJob(storeDir, id, { leaseMs, startStatus });
   });
 }
 
