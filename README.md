@@ -17,6 +17,9 @@ settings or reload a running session.
 
 ## Commands
 
+- `/wrk inbox`: show this session's named Markdown mailbox and live FIFO,
+  plus the `general` broadcast paths. Use the bundled `send-to-pi` helper
+  for durable handoffs; see [file-in operations](docs/devops/file-in.md).
 - `/skill:wrk <task>`: admit the raw task before skill expansion; if the
   skill arrives already expanded, the agent calls `wrk_submit` with its task.
   A receipt contains a durable job ID, not a completion result. An admission

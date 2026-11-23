@@ -9,7 +9,7 @@ import { parseRequest } from '../src/request.mjs';
 
 const { createExtension } = await createJiti(import.meta.url).import('../extensions/index.ts');
 
-function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure, readZellijTab, zellijSessionName, zellijPaneId, collectFileMessages, initialBranch, sharedJobs, cleanupAt7Workspace, admissionFailure, delayTranscript = false, peerRegister, ownerFactory } = {}) {
+function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure, readZellijTab, zellijSessionName, zellijPaneId, collectFileMessages, initialBranch, sharedJobs, cleanupAt7Workspace, admissionFailure, delayTranscript = false, peerRegister, ownerFactory, inboxAddress } = {}) {
   const commands = new Map();
   const tools = new Map();
   const events = new Map();
@@ -78,7 +78,7 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
   };
   if (realStore) Object.assign(deps, store, { storePath: () => realStore });
   const pi = { registerCommand: (name, config) => commands.set(name, config.handler), registerTool: (config) => tools.set(config.name, config), on: (name, handler) => events.set(name, handler), events: { on: (name, handler) => bus.set(name, handler), emit: (name, payload) => { if (name === 'intercom:extension-register') peerRegister?.(payload); bus.get(name)?.(payload); } }, sendUserMessage: (message, options) => messages.push({ message, options }), appendEntry: (customType, data) => branch.push({ id: `entry-${branch.length}`, type: 'custom', customType, data }), sendMessage: (message, options) => { transcript.push({ message, options }); if (!delayTranscript) branch.push({ type: 'message', message: { role: 'custom', ...message } }); } };
-  createExtension(pi, deps);
+  createExtension(pi, deps, inboxAddress);
   const command = (name, input = '') => commands.get(name)(input, ctx);
   const event = (name, payload = {}, context = ctx) => events.get(name)?.(payload, context);
   return { command, event, tools, onBus: (name, handler) => bus.set(name, handler), ctx, jobs, ui, branch, notices, messages, transcript, tick: () => heartbeat?.(), tickWatch: async () => { watchTick?.(); await flush(); }, get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
@@ -623,6 +623,14 @@ test('/wrk queues inspects persistent queue definitions without submitting work'
   assert.equal(h.ui.at(-1).message, 'review');
   assert.equal(h.starts, 0);
   assert.equal(store.listJobs(dir).length, 1);
+});
+
+test('/wrk inbox reports the owning session return address without admitting work', async () => {
+  const h = harness({ inboxAddress: () => 'Your mailbox: /project/.agents/pi/file-in/handles/arc-one' });
+  await h.event('session_start');
+  await h.command('wrk', 'inbox');
+  assert.match(h.ui.at(-1).message, /Your mailbox: \/project/);
+  assert.equal(h.jobs.size, 0);
 });
 
 test('session reload restarts a worker with queued jobs, without admitting duplicates', async () => {

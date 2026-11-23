@@ -8,6 +8,7 @@ import { parseInput } from '../src/input-syntax.mjs';
 import { generateName, loadNameWords } from '../src/names.mjs';
 import { readTab, readTabScreen } from '../src/zellij-watch.mjs';
 import { createTabRegistry } from './at7-tabs.ts';
+import { registerFileIn } from './file-in.ts';
 import { collectFileMessages } from './at7-files.ts';
 import type { At7Message } from './at7-files.ts';
 import { createAt7PeerRelay } from './at7-peers.ts';
@@ -102,7 +103,7 @@ function userText(content: unknown): string | undefined {
 }
 
 /** Bind only Pi command/event handlers. External dependencies remain injectable for host-free tests. */
-export function createExtension(pi: Pi, deps: Dependencies): void {
+export function createExtension(pi: Pi, deps: Dependencies, inboxAddress?: (ctx: Context) => string): void {
   const words = loadNameWords(new URL('../docs/sorted_short_words.csv', import.meta.url));
   const generateWorkItemName = () => generateName(words);
   const display = (job: Job) => job.name ? `${job.name} ${job.id}` : job.id;
@@ -401,6 +402,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     const [verb, id, extra] = args.trim().split(/\s+/);
     const dir = session.dir;
     try {
+      if (verb === 'inbox' && !id) { notify(ctx, inboxAddress?.(ctx) ?? 'File-in not configured', inboxAddress ? 'info' : 'warning'); return; }
       if (verb === 'at7' && id === 'scan') {
         if (extra !== '--all') throw new Error('Usage: /wrk at7 scan --all');
         await scanAt7(ctx, 'all');
@@ -700,6 +702,7 @@ export default async function extension(pi: ExtensionAPI): Promise<void> {
   const [request, store, worker, workspaces] = await Promise.all([
     import('../src/request.mjs'), import('../src/store.mjs'), import('../src/worker.mjs'), import('../src/workspaces.mjs'),
   ]);
+  const inbox = registerFileIn(pi, { projectRoot, storePath: store.storePath, ensureWorker: worker.ensureWorker });
   createExtension(pi, {
     parseRequest: (text, options) => request.parseRequest(text, options) as Request,
     storePath: store.storePath,
@@ -720,5 +723,5 @@ export default async function extension(pi: ExtensionAPI): Promise<void> {
     collectFileMessages,
     createAt7Workspace: (root, cwd) => workspaces.createAt7Workspace(root, cwd),
     cleanupAt7Workspace: (root, path, baseCommit) => workspaces.cleanupAt7Workspace(root, path, baseCommit),
-  });
+  }, ctx => inbox.address(ctx));
 }

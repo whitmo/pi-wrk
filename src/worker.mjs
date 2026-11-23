@@ -5,6 +5,7 @@ import { createServer, createConnection } from 'node:net';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
+import { createPipeBroker } from './file-in.mjs';
 import { createRunners } from './runners.mjs';
 import { admitNamedJob, loadNameWords } from './names.mjs';
 import { createSwarmWorkspaces } from './workspaces.mjs';
@@ -245,6 +246,7 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
     throw new Error('replacement requires a live compatible worker');
   if (replaces) store.listWorkerJobs(storeDir); // Corrupt inventory cannot pass readiness.
   const ownership = injectedStore ? null : await ownWorker(storeDir, replaces);
+  let fileIn;
   const active = new Map();
   const waiting = new Map();
   const occupiedSlots = () => active.size - waiting.size;
@@ -339,6 +341,12 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
       }
     }
     while (!signal?.aborted) {
+      // Only the current worker reads the shared FIFOs; the replacement waits
+      // until promotion, and the draining incumbent releases its readers.
+      if (ownership && !ownership.draining && (!replaces || identity(storeDir)?.token === ownership.token)) {
+        fileIn ??= createPipeBroker(storeDir);
+        try { fileIn.poll(); } catch (error) { console.error(`file-in poll failed: ${error}`); }
+      } else if (fileIn) { fileIn.close(); fileIn = undefined; }
       if (ownership?.draining) {
         const next = nextIdentity(storeDir);
         if (next && workerDefinitelyDead(next)) {
@@ -405,5 +413,5 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
     for (const controller of active.values()) controller.abort();
     await Promise.allSettled([...promises]);
     throw error;
-  } finally { await ownership?.release(); }
+  } finally { fileIn?.close(); await ownership?.release(); }
 }
