@@ -8,7 +8,8 @@ description: Use when submitting or inspecting pi-wrk jobs, selecting an agent, 
 When invoked with a task as `/skill:wrk <task>`, pi-wrk intercepts the raw
 input and admits one job. If this skill arrives already expanded as a
 `<skill name="wrk">` block with a trailing task, call `wrk_submit` **once**
-with `input` set to the exact trailing task (including any selector). Report
+with `input` set to the exact trailing task (including any selector).
+If it is labeled `Skill input:`, pass its value without the label. Report
 the returned job ID, or the admission error. Do not ask the user to retype
 `/bg` or `/&`, guess model aliases, or execute the task in the foreground.
 If `wrk_submit` is unavailable, say admission is unavailable and preserve
@@ -16,9 +17,10 @@ the unsubmitted request; never claim a job was queued.
 
 Use direct Pi slash commands. `/& <prompt>` asks a background router to
 choose agent, council, or swarm. `/bg <prompt>` and `/& bg <prompt>` use a
-background agent. `/wrk <prompt>` also submits to the router. Admission is
-immediate, while worker readiness and completion are separate. Do not make
-the foreground agent plan or execute the submitted prompt.
+background agent. `/wrk <prompt>` also submits to the router. Submission
+checks worker readiness first; a queued receipt means durable admission,
+not completion. Do not make the foreground agent plan or execute the
+submitted prompt.
 
 | Command | Effect |
 | --- | --- |

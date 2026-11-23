@@ -17,6 +17,10 @@ settings or reload a running session.
 
 ## Commands
 
+- `/skill:wrk <task>`: admit the raw task before skill expansion; if the
+  skill arrives already expanded, the agent calls `wrk_submit` with its task.
+  A receipt contains a durable job ID, not a completion result. An admission
+  error means no job was created; do not submit the same task again blindly.
 - `/bg <prompt>` or `/& bg <prompt>`: use a background agent.
 - `/& <prompt>` or `/wrk <prompt>`: route to an agent, council or swarm.
 - `/& a:{name: ari, model: provider/model} <prompt>`: explicit agent/model;

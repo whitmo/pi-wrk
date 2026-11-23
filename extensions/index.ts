@@ -604,12 +604,12 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     }, 5000);
     timer.unref?.();
     active = { sessionId: ctx.sessionManager.getSessionId(), ownerId, dir, timer };
-    // A previous Pi may have exited without shutdown; restart the worker to
-    // reconcile its session-owned jobs even when this session submits no work.
+    // A previous Pi or worker may have exited; resume queued work and reconcile
+    // running jobs even when this session submits nothing new.
     try {
-      const stale = deps.listJobs(dir).find((job: Job) => job.request?.runner === 'btw' && job.status === 'running');
-      if (stale) start(dir, stale, ctx, active.sessionId, ownerId);
-    } catch (error) { notify(ctx, `Could not inspect BTW jobs: ${error instanceof Error ? error.message : String(error)}`, 'error'); }
+      const pendingJob = deps.listJobs(dir).find((job: Job) => ['queued', 'routing', 'running'].includes(job.status));
+      if (pendingJob) start(dir, pendingJob, ctx, active.sessionId, ownerId);
+    } catch (error) { notify(ctx, `Could not inspect pending jobs: ${error instanceof Error ? error.message : String(error)}`, 'error'); }
     turn = undefined;
     pending = undefined;
     ctx.ui.setStatus('wrk', undefined);

@@ -614,14 +614,28 @@ test('/wrk queues inspects persistent queue definitions without submitting work'
   const root = mkdtempSync(join(tmpdir(), 'wrk-queue-ui-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const dir = store.storePath(root);
-  store.admitJob(dir, { ownerId: 'other-owner', projectRoot: root, cwd: root,
+  const prior = store.admitJob(dir, { ownerId: 'other-owner', projectRoot: root, cwd: root,
     request: { runner: 'agent', prompt: 'inspect', options: {}, queue: 'review', lifetime: 'independent' } });
+  store.updateJob(dir, prior.id, { status: 'succeeded' });
   const h = harness({ realStore: dir });
   await h.event('session_start');
   await h.command('wrk', 'queues');
   assert.equal(h.ui.at(-1).message, 'review');
   assert.equal(h.starts, 0);
   assert.equal(store.listJobs(dir).length, 1);
+});
+
+test('session reload restarts a worker with queued jobs, without admitting duplicates', async () => {
+  const existing = new Map([['job-queued', {
+    id: 'job-queued', status: 'queued',
+    request: { runner: 'agent', prompt: 'queued work', options: {}, lifetime: 'session' },
+  }]]);
+  const h = harness({ sharedJobs: existing });
+  await h.event('session_start', { reason: 'reload' });
+  await flush();
+  assert.equal(h.starts, 1);
+  assert.equal(h.jobs.size, 1);
+  assert.equal(h.aborted, 0);
 });
 
 test('heartbeat delivers durable questions once without foreground work or stale-session UI', async () => {
