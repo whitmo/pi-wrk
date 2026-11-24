@@ -1,12 +1,15 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { Type } from '@sinclair/typebox';
 import { captureFocus } from '../src/focus.mjs';
+import { captureConversation } from '../src/conversation.mjs';
 import { parseInput } from '../src/input-syntax.mjs';
 import { generateName, loadNameWords } from '../src/names.mjs';
 import { readTab, readTabScreen } from '../src/zellij-watch.mjs';
 import { createTabRegistry } from './at7-tabs.ts';
+import { registerFileIn } from './file-in.ts';
 import { collectFileMessages } from './at7-files.ts';
 import type { At7Message } from './at7-files.ts';
 import { createAt7PeerRelay } from './at7-peers.ts';
@@ -15,6 +18,7 @@ import type { At7Signal } from './at7-peers.ts';
 type Request = {
   runner: string;
   prompt: string;
+  conversation?: ReturnType<typeof captureConversation>;
   options: Record<string, unknown>;
   queue: string | null;
   lifetime: 'session' | 'independent';
@@ -39,6 +43,7 @@ type Job = {
 };
 type Session = {
   getSessionId(): string;
+  buildSessionProjection?: ExtensionContext['sessionManager']['buildSessionProjection'];
   getBranch(): Array<{ id: string; type: string; customType?: string; data?: unknown; message?: { role?: string; content?: unknown } }>;
 };
 type Context = {
@@ -52,7 +57,7 @@ type Context = {
 };
 type BtwResult = { answer?: string; error?: string };
 type BtwSubmission = { ctx: Context; question: string; accept(): void; done(result: BtwResult): void };
-type Pi = Pick<ExtensionAPI, 'registerCommand' | 'on' | 'events' | 'sendUserMessage' | 'sendMessage' | 'appendEntry'>;
+type Pi = Pick<ExtensionAPI, 'registerCommand' | 'registerTool' | 'on' | 'events' | 'sendUserMessage' | 'sendMessage' | 'appendEntry'>;
 type Dependencies = {
   parseRequest(text: string, options: { alias: string }): Request;
   storePath(root: string): string;
@@ -101,7 +106,9 @@ function userText(content: unknown): string | undefined {
 }
 
 /** Bind only Pi command/event handlers. External dependencies remain injectable for host-free tests. */
-export function createExtension(pi: Pi, deps: Dependencies): void {
+export function createExtension(pi: Pi, deps: Dependencies, inboxAddress?: (ctx: Context) => string): void {
+  const namespacedOnly = process.env.PI_WRK_NAMESPACED_ONLY === '1'
+    || existsSync(join(process.cwd(), '.pi', 'pi-wrk-namespaced-only'));
   const words = loadNameWords(new URL('../docs/sorted_short_words.csv', import.meta.url));
   const generateWorkItemName = () => generateName(words);
   const display = (job: Job) => job.name ? `${job.name} ${job.id}` : job.id;
@@ -345,11 +352,19 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
       notify(ctx, error instanceof Error ? error.message : String(error), 'error');
     }
   }
-  async function submit(alias: string, args: string, ctx: Context, model?: string): Promise<boolean> {
+  async function submit(alias: string, args: string, ctx: Context, { model, requireTask }: { model?: string; requireTask?: boolean } = {}): Promise<{ job?: Job; error?: string }> {
     try {
       const session = current(ctx);
       if (!session) throw new Error('Session owner unavailable; retry after session start');
-      const request = deps.parseRequest(args, { alias });
+      const inherit = alias === 'bg' && /^\+(?:\s|$)/.test(args.trimStart());
+      const task = inherit ? args.trimStart().slice(1).trimStart() : args;
+      if (inherit && !task) throw new Error('Usage: /wrk bg + <task>');
+      const request = deps.parseRequest(task, { alias });
+      if (requireTask && request.handoff) throw new Error('Usage: /wrk bg [+] <task>');
+      if (inherit) {
+        if (request.runner !== 'agent' || request.handoff) throw new Error('Background context requires an explicit agent task');
+        request.conversation = captureConversation(ctx.sessionManager);
+      }
       if (model) request.options = { ...request.options, model };
       if (request.runner !== 'shell') request.options = {
         ...request.options,
@@ -387,10 +402,11 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
         ctx.abort();
       }
       notify(ctx, `${display(job)} queued (${request.lifetime})${handoff ? '; handoff awaiting settlement' : ''}`);
-      return true;
+      return { job };
     } catch (error) {
-      notify(ctx, error instanceof Error ? error.message : String(error), 'error');
-      return false;
+      const message = error instanceof Error ? error.message : String(error);
+      notify(ctx, message, 'error');
+      return { error: message };
     }
   }
   async function manage(args: string, ctx: Context) {
@@ -399,6 +415,12 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     const [verb, id, extra] = args.trim().split(/\s+/);
     const dir = session.dir;
     try {
+      if (verb === 'bg') {
+        if (!id) throw new Error('Usage: /wrk bg [+] <task>');
+        await submit('bg', args.trimStart().slice(2).trimStart(), ctx, { requireTask: true });
+        return;
+      }
+      if (verb === 'inbox' && !id) { notify(ctx, inboxAddress?.(ctx) ?? 'File-in not configured', inboxAddress ? 'info' : 'warning'); return; }
       if (verb === 'at7' && id === 'scan') {
         if (extra !== '--all') throw new Error('Usage: /wrk at7 scan --all');
         await scanAt7(ctx, 'all');
@@ -453,10 +475,27 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     } catch (error) { notify(ctx, error instanceof Error ? error.message : String(error), 'error'); }
   }
 
-  pi.registerCommand('&', { description: 'Submit work asynchronously', handler: async (args, ctx) => { await submit('&', args, ctx); } });
-  pi.registerCommand('bg', { description: 'Submit to a background agent', handler: async (args, ctx) => { await submit('bg', args, ctx); } });
-  for (const condition of ['&&', '||', '~&&', '~||'])
-    pi.registerCommand(condition, { description: `Submit conditional background job (${condition})`, handler: async (args, ctx) => { await submit(condition, args, ctx); } });
+  pi.registerTool({
+    name: 'wrk_submit',
+    label: 'Submit background job',
+    description: 'Admit exactly one pi-wrk job from a wrk skill request. Pass the raw task argument, including any a:{name, model} selector. This does not execute the task in the foreground.',
+    promptSnippet: 'Submit a pi-wrk background job from an expanded wrk skill request; returns a durable job ID, not completion.',
+    parameters: Type.Object({ input: Type.String({ minLength: 1 }) }),
+    async execute(_callId, { input }, _signal, _onUpdate, ctx) {
+      const { job, error } = await submit('wrk', input, ctx);
+      if (!job) return { content: [{ type: 'text' as const, text: `Admission failed: ${error}` }], details: {}, isError: true };
+      return {
+        content: [{ type: 'text' as const, text: `${display(job)} queued (${job.request.lifetime}); admission only, not worker readiness or completion. Check /wrk status ${job.id}.` }],
+        details: { jobId: job.id, status: job.status },
+      };
+    },
+  });
+  if (!namespacedOnly) {
+    pi.registerCommand('&', { description: 'Submit work asynchronously', handler: async (args, ctx) => { await submit('&', args, ctx); } });
+    pi.registerCommand('bg', { description: 'Submit to a background agent (+ to inherit conversation)', handler: async (args, ctx) => { await submit('bg', args, ctx); } });
+    for (const condition of ['&&', '||', '~&&', '~||'])
+      pi.registerCommand(condition, { description: `Submit conditional background job (${condition})`, handler: async (args, ctx) => { await submit(condition, args, ctx); } });
+  }
   pi.registerCommand('wrk', { description: 'Submit or inspect background jobs', handler: async (args, ctx) => manage(args, ctx) });
   pi.registerCommand('watch:zellij', { description: 'Wake once when a named tab changes', handler: async (args, ctx) => {
     stopWatch();
@@ -483,12 +522,14 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
   } });
 
   pi.on('input', async (event, ctx) => {
-    if (event.source === 'extension') return { action: 'continue' };
+    if (namespacedOnly || event.source === 'extension') return { action: 'continue' };
     try {
-      const syntax = parseInput(event.text);
+      // Pi expands skill commands only after input handlers; admit the raw task here.
+      const skill = /^\/skill:wrk(?:\s+([\s\S]*))?$/.exec(event.text);
+      const syntax = skill ? { alias: 'wrk', args: skill[1] ?? '', foreground: '' } : parseInput(event.text);
       if (!syntax) return { action: 'continue' };
       if (event.images?.length) throw new Error('Background input cannot include images');
-      if (!await submit(syntax.alias, syntax.args, ctx, syntax.model)) return { action: 'handled' };
+      if (!(await submit(syntax.alias, syntax.args, ctx, { model: syntax.model })).job) return { action: 'handled' };
       return syntax.foreground ? { action: 'transform', text: syntax.foreground } : { action: 'handled' };
     } catch (error) {
       notify(ctx, error instanceof Error ? error.message : String(error), 'error');
@@ -496,7 +537,7 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     }
   });
 
-  pi.on('session_start', (_event, ctx) => {
+  pi.on('session_start', (event, ctx) => {
     stopWatch();
     tabs.clear();
     seen.clear();
@@ -527,11 +568,24 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     }
     for (const entry of journal.values()) if (entry.state === 'pending' && displayedAt7(ctx, entry.jobId)) recordAt7({ ...entry, state: 'delivered' });
     for (const done of btwJobs.values()) done({ error: 'Owning Pi session changed before BTW replied' });
-    if (active) { deps.clearInterval(active.timer); deps.closeOwner(active.dir, active.ownerId); active = undefined; }
-    if (pending) block('Session changed before the foreground settled');
     const dir = deps.storePath(deps.projectRoot(ctx.cwd));
-    const ownerId = deps.newOwnerId();
+    const sessionId = ctx.sessionManager.getSessionId();
+    // Only a reload of this same session can inherit its lease. A quit or a
+    // session change writes a tombstone; a copied/forked transcript cannot
+    // inherit a different session's owner.
+    const leaseEntry = [...ctx.sessionManager.getBranch()].reverse().find(entry => entry.type === 'custom' && entry.customType === 'wrk-owner') as { data?: unknown } | undefined;
+    const previous = leaseEntry?.data as
+      { sessionId?: string; ownerId?: string; dir?: string; closed?: boolean } | undefined;
+    const reuse = event.reason === 'reload' && previous?.sessionId === sessionId && previous.dir === dir && !previous.closed;
+    if (active) {
+      deps.clearInterval(active.timer);
+      if (!reuse) deps.closeOwner(active.dir, active.ownerId);
+      active = undefined;
+    }
+    if (pending) block('Session changed before the foreground settled');
+    const ownerId = reuse ? previous!.ownerId! : deps.newOwnerId();
     deps.touchOwner(dir, ownerId);
+    if (!reuse) pi.appendEntry('wrk-owner', { sessionId, ownerId, dir, closed: false });
     const delivered = new Set<string>();
     const timer = deps.setInterval(() => {
       if (current(ctx)?.ownerId !== ownerId) return;
@@ -572,22 +626,29 @@ export function createExtension(pi: Pi, deps: Dependencies): void {
     }, 5000);
     timer.unref?.();
     active = { sessionId: ctx.sessionManager.getSessionId(), ownerId, dir, timer };
-    // A previous Pi may have exited without shutdown; restart the worker to
-    // reconcile its session-owned jobs even when this session submits no work.
+    // A previous Pi or worker may have exited; resume queued work and reconcile
+    // running jobs even when this session submits nothing new.
     try {
-      const stale = deps.listJobs(dir).find((job: Job) => job.request?.runner === 'btw' && job.status === 'running');
-      if (stale) start(dir, stale, ctx, active.sessionId, ownerId);
-    } catch (error) { notify(ctx, `Could not inspect BTW jobs: ${error instanceof Error ? error.message : String(error)}`, 'error'); }
+      const pendingJob = deps.listJobs(dir).find((job: Job) => ['queued', 'routing', 'running'].includes(job.status));
+      if (pendingJob) start(dir, pendingJob, ctx, active.sessionId, ownerId);
+    } catch (error) { notify(ctx, `Could not inspect pending jobs: ${error instanceof Error ? error.message : String(error)}`, 'error'); }
     turn = undefined;
     pending = undefined;
     ctx.ui.setStatus('wrk', undefined);
   });
-  pi.on('session_shutdown', (_event, ctx) => {
+  pi.on('session_shutdown', (event, ctx) => {
     if (active?.sessionId !== ctx.sessionManager.getSessionId()) return;
     stopWatch();
     tabs.clear();
     for (const done of btwJobs.values()) done({ error: 'Owning Pi session closed before BTW replied' });
-    if (active) { deps.clearInterval(active.timer); deps.closeOwner(active.dir, active.ownerId); active = undefined; }
+    if (active) {
+      deps.clearInterval(active.timer);
+      if (event.reason !== 'reload') {
+        deps.closeOwner(active.dir, active.ownerId);
+        pi.appendEntry('wrk-owner', { sessionId: active.sessionId, ownerId: active.ownerId, dir: active.dir, closed: true });
+      }
+      active = undefined;
+    }
     if (pending) block('Session closed before the foreground settled');
     turn = undefined;
     ctx.ui.setStatus('wrk', undefined);
@@ -661,6 +722,7 @@ export default async function extension(pi: ExtensionAPI): Promise<void> {
   const [request, store, worker, workspaces] = await Promise.all([
     import('../src/request.mjs'), import('../src/store.mjs'), import('../src/worker.mjs'), import('../src/workspaces.mjs'),
   ]);
+  const inbox = registerFileIn(pi, { projectRoot, storePath: store.storePath, ensureWorker: worker.ensureWorker });
   createExtension(pi, {
     parseRequest: (text, options) => request.parseRequest(text, options) as Request,
     storePath: store.storePath,
@@ -681,5 +743,5 @@ export default async function extension(pi: ExtensionAPI): Promise<void> {
     collectFileMessages,
     createAt7Workspace: (root, cwd) => workspaces.createAt7Workspace(root, cwd),
     cleanupAt7Workspace: (root, path, baseCommit) => workspaces.cleanupAt7Workspace(root, path, baseCommit),
-  });
+  }, ctx => inbox.address(ctx));
 }

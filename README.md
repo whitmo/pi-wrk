@@ -17,7 +17,27 @@ settings or reload a running session.
 
 ## Commands
 
-- `/bg <prompt>` or `/& bg <prompt>`: use a background agent.
+- `/wrk inbox`: show this session's named Markdown mailbox and live FIFO,
+  plus the `general` broadcast paths. Use the bundled `send-to-pi` helper
+  for durable handoffs; see [file-in operations](docs/devops/file-in.md).
+- `/skill:wrk <task>`: admit the raw task before skill expansion; if the
+  skill arrives already expanded, the agent calls `wrk_submit` with its task.
+  A receipt contains a durable job ID, not a completion result. An admission
+  error means no job was created; do not submit the same task again blindly.
+- `/wrk bg <prompt>`: run a background agent with no parent transcript. The
+  agent still defaults to the submitting model and project.
+- `/wrk bg + <prompt>`: start a new agent with a launch-time copy of the active
+  conversation text. Pi edits and compaction are respected. Inactive branches,
+  branch summaries, attachments, thinking, tool calls and tool results are not
+  copied. The snapshot is limited to 256 KiB and is retained in the private
+  local job record. The worker opens its own temporary session; the original
+  Pi session is neither shared nor modified.
+- `/bg <prompt>` and `/bg + <prompt>` are shortcuts for those commands.
+  To pilot under `/wrk` alongside another extension that owns `/bg` or `/&`,
+  create an empty `.pi/pi-wrk-namespaced-only` file in the directory where
+  Pi starts, or set `PI_WRK_NAMESPACED_ONLY=1` before launching Pi. This
+  disables pi-wrk's short aliases and bare composer input interception, not
+  `/wrk`.
 - `/& <prompt>` or `/wrk <prompt>`: route to an agent, council or swarm.
 - `/& a:{name: ari, model: provider/model} <prompt>`: explicit agent/model;
   unknown names and unavailable models fail rather than being ignored.
@@ -102,9 +122,18 @@ if the owner is absent. This is one-way delivery, not a reply channel.
 New jobs get unique `verb.noun.digit` names from
 `docs/sorted_short_words.csv`; unnamed worker agents inherit their job's
 name. Explicit agent definitions such as `a:{name: ari}` are unaffected.
-After reloading a new pi-wrk release, an older live worker is not reused or
-stopped automatically: wait for its jobs to drain, stop the old worker, then
-retry submission. This avoids interrupting active work.
+On a compatible worker-code update, admission starts a replacement and waits
+for its readiness before handing queued and new root jobs to it. The previous
+worker finishes active work (including workflow children) and exits after
+its drain; running jobs are never replayed. Named queues and scheduler slots
+are shared across generations. If replacement startup fails, pi-wrk reports
+`worker.log`, retries only confirmed-dead attempts a bounded number of times,
+and leaves the old worker serving. If its ownership cannot be verified, retry
+manually rather than killing a live worker. A pre-upgrade protocol-2/token-only
+worker cannot safely hand off: let its jobs drain, stop it by an operator-safe
+procedure, then retry. The first upgrade from that version is **not** seamless.
+A Pi extension reload preserves the same session's job lease; quitting or
+switching sessions still closes session-owned jobs.
 
 The default `session` lifetime ends with the submitting session's lease,
 including queued work. Prefix a request with `--lifetime independent` to
@@ -134,7 +163,7 @@ context snapshot: goals, scope, constraints, notes, references and knowledge
 paths. The snapshot is captured when queued and stays the same through
 routing, council/swarm children and synthesis. Focus paths point back to
 the source project, including when a child runs in another worktree. The
-parent conversation and knowledge-base contents are not copied.
+parent conversation and knowledge-base contents are not copied by focus inheritance.
 
 No active focus means no inherited context. `/bg --focus none <prompt>`
 opts out. Context-only inheritance does not load pi-focus or enable any

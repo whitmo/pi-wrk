@@ -1,15 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createJiti } from 'jiti';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as store from '../src/store.mjs';
+import { parseRequest } from '../src/request.mjs';
 
 const { createExtension } = await createJiti(import.meta.url).import('../extensions/index.ts');
 
-function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure, readZellijTab, zellijSessionName, zellijPaneId, collectFileMessages, initialBranch, sharedJobs, cleanupAt7Workspace, admissionFailure, delayTranscript = false, peerRegister } = {}) {
+function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure, readZellijTab, zellijSessionName, zellijPaneId, collectFileMessages, initialBranch, sharedJobs, cleanupAt7Workspace, admissionFailure, delayTranscript = false, peerRegister, ownerFactory, inboxAddress } = {}) {
   const commands = new Map();
+  const tools = new Map();
   const events = new Map();
   const bus = new Map();
   const jobs = sharedJobs ?? new Map();
@@ -66,7 +68,7 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
       return timer;
     },
     clearInterval: (timer) => { timer.cleared = true; },
-    newOwnerId: () => `owner-${owner}`,
+    newOwnerId: ownerFactory ?? (() => `owner-${owner}`),
     readZellijTab: readZellijTab ?? (async () => { throw new Error('No Zellij test fixture'); }),
     zellijSessionName: zellijSessionName ?? (() => 'agent-zellij'),
     zellijPaneId: zellijPaneId ?? (() => 42),
@@ -75,11 +77,11 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
     cleanupAt7Workspace: cleanupAt7Workspace ?? (() => true),
   };
   if (realStore) Object.assign(deps, store, { storePath: () => realStore });
-  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), on: (name, handler) => events.set(name, handler), events: { on: (name, handler) => bus.set(name, handler), emit: (name, payload) => { if (name === 'intercom:extension-register') peerRegister?.(payload); bus.get(name)?.(payload); } }, sendUserMessage: (message, options) => messages.push({ message, options }), appendEntry: (customType, data) => branch.push({ id: `entry-${branch.length}`, type: 'custom', customType, data }), sendMessage: (message, options) => { transcript.push({ message, options }); if (!delayTranscript) branch.push({ type: 'message', message: { role: 'custom', ...message } }); } };
-  createExtension(pi, deps);
+  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), registerTool: (config) => tools.set(config.name, config), on: (name, handler) => events.set(name, handler), events: { on: (name, handler) => bus.set(name, handler), emit: (name, payload) => { if (name === 'intercom:extension-register') peerRegister?.(payload); bus.get(name)?.(payload); } }, sendUserMessage: (message, options) => messages.push({ message, options }), appendEntry: (customType, data) => branch.push({ id: `entry-${branch.length}`, type: 'custom', customType, data }), sendMessage: (message, options) => { transcript.push({ message, options }); if (!delayTranscript) branch.push({ type: 'message', message: { role: 'custom', ...message } }); } };
+  createExtension(pi, deps, inboxAddress);
   const command = (name, input = '') => commands.get(name)(input, ctx);
   const event = (name, payload = {}, context = ctx) => events.get(name)?.(payload, context);
-  return { command, event, onBus: (name, handler) => bus.set(name, handler), ctx, jobs, ui, branch, notices, messages, transcript, tick: () => heartbeat?.(), tickWatch: async () => { watchTick?.(); await flush(); }, get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
+  return { command, event, tools, onBus: (name, handler) => bus.set(name, handler), ctx, jobs, ui, branch, notices, messages, transcript, tick: () => heartbeat?.(), tickWatch: async () => { watchTick?.(); await flush(); }, get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
 }
 
 
@@ -612,14 +614,36 @@ test('/wrk queues inspects persistent queue definitions without submitting work'
   const root = mkdtempSync(join(tmpdir(), 'wrk-queue-ui-'));
   t.after(() => rmSync(root, { recursive: true, force: true }));
   const dir = store.storePath(root);
-  store.admitJob(dir, { ownerId: 'other-owner', projectRoot: root, cwd: root,
+  const prior = store.admitJob(dir, { ownerId: 'other-owner', projectRoot: root, cwd: root,
     request: { runner: 'agent', prompt: 'inspect', options: {}, queue: 'review', lifetime: 'independent' } });
+  store.updateJob(dir, prior.id, { status: 'succeeded' });
   const h = harness({ realStore: dir });
   await h.event('session_start');
   await h.command('wrk', 'queues');
   assert.equal(h.ui.at(-1).message, 'review');
   assert.equal(h.starts, 0);
   assert.equal(store.listJobs(dir).length, 1);
+});
+
+test('/wrk inbox reports the owning session return address without admitting work', async () => {
+  const h = harness({ inboxAddress: () => 'Your mailbox: /project/.agents/pi/file-in/handles/arc-one' });
+  await h.event('session_start');
+  await h.command('wrk', 'inbox');
+  assert.match(h.ui.at(-1).message, /Your mailbox: \/project/);
+  assert.equal(h.jobs.size, 0);
+});
+
+test('session reload restarts a worker with queued jobs, without admitting duplicates', async () => {
+  const existing = new Map([['job-queued', {
+    id: 'job-queued', status: 'queued',
+    request: { runner: 'agent', prompt: 'queued work', options: {}, lifetime: 'session' },
+  }]]);
+  const h = harness({ sharedJobs: existing });
+  await h.event('session_start', { reason: 'reload' });
+  await flush();
+  assert.equal(h.starts, 1);
+  assert.equal(h.jobs.size, 1);
+  assert.equal(h.aborted, 0);
 });
 
 test('heartbeat delivers durable questions once without foreground work or stale-session UI', async () => {
@@ -658,6 +682,47 @@ test('incompatible live worker prevents admission on command and inline input', 
   assert.equal(h.starts, 2);
 });
 
+test('skill command admits one durable job without involving the foreground', async () => {
+  const h = harness({ parser: parseRequest });
+  await h.event('session_start');
+  const result = await h.event('input', {
+    text: '/skill:wrk a:{name: ari} prepare a report',
+    source: 'interactive',
+  });
+  assert.deepEqual(result, { action: 'handled' });
+  assert.equal(h.jobs.size, 1);
+  assert.equal(h.jobs.get('job-1').request.options.name, 'ari');
+  assert.equal(h.jobs.get('job-1').request.prompt, 'prepare a report');
+  assert.equal(h.jobs.get('job-1').status, 'queued');
+  assert.equal(h.aborted, 0);
+  assert.equal(h.messages.length, 0);
+  assert.match(h.ui.at(-1).message, /job-1 queued/);
+});
+
+test('expanded skill can submit through an agent-callable admission tool', async () => {
+  const h = harness({ parser: parseRequest });
+  await h.event('session_start');
+  const admission = h.tools.get('wrk_submit');
+  assert.ok(admission, 'wrk_submit must be registered for the agent');
+  const result = await admission.execute('call-1', { input: 'a:{name: ari} prepare a report' }, undefined, undefined, h.ctx);
+  assert.equal(h.jobs.size, 1);
+  assert.equal(h.aborted, 0);
+  assert.match(result.content[0].text, /job-1.*queued/);
+  assert.equal(result.details.jobId, 'job-1');
+});
+
+test('skill admission failure reports the real worker error without inventing a job', async () => {
+  const h = harness({ parser: parseRequest, startup: () => Promise.reject(new Error('worker unavailable')) });
+  await h.event('session_start');
+  const result = await h.tools.get('wrk_submit').execute('call-1', { input: 'prepare a report' }, undefined, undefined, h.ctx);
+  assert.equal(result.isError, true);
+  assert.match(result.content[0].text, /Admission failed: worker unavailable/);
+  assert.equal(h.jobs.size, 0);
+  assert.deepEqual(await h.event('input', { text: '/skill:wrk prepare a report', source: 'interactive' }), { action: 'handled' });
+  assert.equal(h.jobs.size, 0);
+  assert.equal(h.aborted, 0);
+});
+
 test('/wrk routes inspection and cancellation without admitting another job', async () => {
   const h = harness();
   await h.event('session_start');
@@ -683,6 +748,43 @@ test('session owner rotates on replacement and old session closes; independent r
   assert.equal(h.jobs.get('job-1').ownerId, 'owner-session-1');
   assert.equal(h.jobs.get('job-2').ownerId, 'owner-session-2');
   assert.ok(h.ui.some((item) => item.closed === 'owner-session-1'));
+});
+
+test('reload retains the session lease and identity; quit and session replacement close it', async () => {
+  const h = harness();
+  await h.event('session_start');
+  await h.command('bg', 'before reload');
+  await h.event('session_shutdown', { reason: 'reload' });
+  assert.equal(h.ui.some(item => item.closed === 'owner-session-1'), false);
+  await h.event('session_start', { reason: 'reload' });
+  await h.command('bg', 'after reload');
+  assert.equal(h.jobs.get('job-2').ownerId, h.jobs.get('job-1').ownerId);
+  h.tick();
+  assert.ok(h.ui.some(item => item.touched === 'owner-session-1'));
+  await h.event('session_shutdown', { reason: 'quit' });
+  assert.ok(h.ui.some(item => item.closed === 'owner-session-1'));
+});
+
+test('real lease survives extension recreation on reload but closes on quit', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-reload-owner-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'store');
+  const h = harness({ realStore: dir });
+  await h.event('session_start');
+  await h.command('bg', 'old session job');
+  const first = store.listJobs(dir)[0];
+  await h.event('session_shutdown', { reason: 'reload' });
+  assert.equal(store.ownerAlive(dir, first.ownerId), true);
+  const reload = harness({ realStore: dir, initialBranch: h.branch });
+  await reload.event('session_start', { reason: 'reload' });
+  await reload.command('bg', 'new session job');
+  assert.equal(store.listJobs(dir)[0].ownerId, first.ownerId);
+  await reload.event('session_shutdown', { reason: 'quit' });
+  assert.equal(store.ownerAlive(dir, first.ownerId), false);
+  const afterQuit = harness({ realStore: dir, initialBranch: reload.branch, ownerFactory: () => 'owner-after-quit' });
+  await afterQuit.event('session_start', { reason: 'reload' });
+  await afterQuit.command('bg', 'new owner');
+  assert.notEqual(store.listJobs(dir)[0].ownerId, first.ownerId);
 });
 
 test('independent lifetime retains origin owner for notices without tying execution to lease', async () => {
@@ -1076,4 +1178,62 @@ test('first resolved recipient remains pinned if publication fails before ACK', 
   await h.event('session_start');
   await h.event('before_agent_start', { prompt: 'name reused' });
   assert.equal(sent, 1, 'never attempt publication to a replacement name holder');
+});
+
+
+test('namespaced background pilot admits fresh and active-context tasks without short aliases', async t => {
+  const original = process.env.PI_WRK_NAMESPACED_ONLY;
+  process.env.PI_WRK_NAMESPACED_ONLY = '1';
+  t.after(() => {
+    if (original === undefined) delete process.env.PI_WRK_NAMESPACED_ONLY;
+    else process.env.PI_WRK_NAMESPACED_ONLY = original;
+  });
+  const h = harness({ parser: parseRequest });
+  h.ctx.sessionManager.buildSessionProjection = () => ({ entries: [
+    { sourceEntry: { type: 'message' }, messages: [{ role: 'user', content: [
+      { type: 'text', text: 'active user text' }, { type: 'image', data: 'secret image' },
+    ] }] },
+    { sourceEntry: { type: 'message' }, messages: [{ role: 'assistant', content: [
+      { type: 'text', text: 'active assistant text' }, { type: 'thinking', thinking: 'secret reasoning' },
+      { type: 'toolCall', name: 'read', arguments: { path: 'secret path' } },
+    ] }] },
+    { sourceEntry: { type: 'message' }, messages: [{ role: 'toolResult', content: 'secret output' }] },
+    { sourceEntry: { type: 'message', message: { role: 'user', content: 'redacted raw text' } }, messages: [] },
+    { sourceEntry: { type: 'branch_summary' }, messages: [{ role: 'user', content: 'abandoned branch' }] },
+  ] });
+  await h.event('session_start');
+  assert.deepEqual(await h.event('input', { text: '& other extension owns this', source: 'interactive' }), { action: 'continue' });
+  assert.throws(() => h.command('bg', 'other extension owns this'), TypeError);
+  await h.command('wrk', 'bg inspect fresh');
+  await h.command('wrk', 'bg + inspect inherited');
+  h.ctx.sessionManager.buildSessionProjection = () => { throw new Error('parent later changed'); };
+  const [fresh, inherited] = [...h.jobs.values()].map(job => job.request);
+  assert.equal(fresh.runner, 'agent');
+  assert.equal(fresh.prompt, 'inspect fresh');
+  assert.equal(fresh.conversation, undefined);
+  assert.equal(inherited.prompt, 'inspect inherited');
+  assert.deepEqual(inherited.conversation, [
+    { role: 'user', text: 'active user text' }, { role: 'assistant', text: 'active assistant text' },
+  ]);
+  await h.command('wrk', 'bg --lifetime independent');
+  assert.match(h.ui.at(-1).message, /Usage: \/wrk bg/);
+  assert.equal(h.aborted, 0);
+  await h.command('wrk', 'bg +');
+  assert.equal(h.jobs.size, 2);
+  assert.match(h.ui.at(-1).message, /Usage: \/wrk bg/);
+});
+
+
+test('checkout-local marker keeps short aliases with the existing owner', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-wrk-mode-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.mock.method(process, 'cwd', () => dir);
+  mkdirSync(join(dir, '.pi'));
+  writeFileSync(join(dir, '.pi', 'pi-wrk-namespaced-only'), '');
+  const h = harness({ parser: parseRequest });
+  assert.throws(() => h.command('bg', 'do not launch'), TypeError);
+  assert.throws(() => h.command('&', 'do not launch'), TypeError);
+  await h.event('session_start');
+  await h.command('wrk', 'bg local pilot');
+  assert.equal(h.jobs.size, 1);
 });

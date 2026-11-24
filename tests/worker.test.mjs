@@ -444,6 +444,197 @@ test('detached worker executes durable admission and reconnects without duplicat
   }
 });
 
+test('rolling readiness transfers new roots while old jobs drain without replay', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-rolling-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'store');
+  const request = (runner, prompt, queue = null) => ({ runner, prompt, lifetime: 'independent', queue, options: runner === 'shell' ? { command: 'printf new-generation' } : {} });
+  const oldJob = admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root, request: request('agent', 'old', 'serial') });
+  let releaseOld, oldRuns = 0;
+  const old = runWorker({ storeDir: dir, pollMs: 5, runners: { agent: async () => { oldRuns++; await new Promise(resolve => { releaseOld = resolve; }); return { summary: 'old completed' }; } } });
+  let child;
+  try {
+    await until(() => getJob(dir, oldJob.id).status === 'running');
+    const lock = join(dir, 'worker.lock');
+    writeFileSync(lock, readFileSync(lock, 'utf8').replace(/buildId: .*/, 'buildId: older-compatible-build'));
+    await ensureWorker(dir, { spawnWorker: (command, args, options) => { child = spawn(command, args, options); return child; }, timeoutMs: 4000 });
+    assert.equal(getJob(dir, oldJob.id).status, 'running');
+    const newJob = admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root, request: request('shell', 'new') });
+    const blocked = admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root, request: request('shell', 'queued', 'serial') });
+    await until(() => getJob(dir, newJob.id).status === 'succeeded', 3000);
+    assert.equal(getJob(dir, blocked.id).status, 'queued', 'cross-generation queue exclusion');
+    assert.equal(getJob(dir, oldJob.id).status, 'running');
+    releaseOld();
+    await old;
+    await until(() => getJob(dir, blocked.id).status === 'succeeded', 3000);
+    await until(() => existsSync(join(dir, 'worker.lock')) && !existsSync(join(dir, 'worker.next.lock')), 3000);
+    assert.equal(oldRuns, 1);
+    assert.equal(getJob(dir, oldJob.id).status, 'succeeded');
+  } finally {
+    releaseOld?.();
+    await old.catch(() => {});
+    if (child?.exitCode === null && child.signalCode === null) { child.ref(); const closed = once(child, 'close'); child.kill('SIGTERM'); await closed; }
+  }
+});
+
+test('replacement cannot exceed shared concurrency until an old slot drains', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-rolling-slots-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'store');
+  const held = Array.from({ length: 3 }, (_, i) => admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root,
+    request: { runner: 'agent', prompt: `held ${i}`, lifetime: 'independent' } }));
+  const releases = [];
+  const stop = new AbortController();
+  const old = runWorker({ storeDir: dir, pollMs: 5, signal: stop.signal, concurrency: 3,
+    runners: { agent: async () => { await new Promise(resolve => { releases.push(resolve); }); return {}; } } });
+  let replacement;
+  try {
+    await until(() => held.every(j => getJob(dir, j.id).status === 'running'));
+    const lock = join(dir, 'worker.lock');
+    writeFileSync(lock, readFileSync(lock, 'utf8').replace(/buildId: .*/, 'buildId: older-build'));
+    await ensureWorker(dir, { timeoutMs: 4000, spawnWorker: (command, args, options) => {
+      replacement = spawn(command, args, options); return replacement;
+    } });
+    const next = admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root,
+      request: { runner: 'shell', prompt: '', lifetime: 'independent', options: { command: 'printf capacity' } } });
+    await new Promise(resolve => setTimeout(resolve, 120));
+    assert.equal(getJob(dir, next.id).status, 'queued');
+    releases.shift()();
+    await until(() => getJob(dir, next.id).status === 'succeeded', 3000);
+  } finally {
+    for (const release of releases) release();
+    stop.abort(); await old.catch(() => {});
+    if (replacement?.exitCode === null && replacement.signalCode === null) {
+      replacement.ref(); const closed = once(replacement, 'close'); replacement.kill('SIGTERM'); await closed;
+    }
+  }
+});
+
+test('concurrent upgrade requests converge on one live replacement', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-concurrent-upgrade-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'store');
+  const first = admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root,
+    request: { runner: 'agent', prompt: 'hold', lifetime: 'independent' } });
+  let release;
+  const stop = new AbortController();
+  const old = runWorker({ storeDir: dir, pollMs: 5, signal: stop.signal,
+    runners: { agent: async () => { await new Promise(resolve => { release = resolve; }); return {}; } } });
+  const children = [];
+  try {
+    await until(() => getJob(dir, first.id).status === 'running');
+    const lock = join(dir, 'worker.lock');
+    writeFileSync(lock, readFileSync(lock, 'utf8').replace(/buildId: .*/, 'buildId: older-build'));
+    const options = { timeoutMs: 4000, spawnWorker: (command, args, config) => {
+      const child = spawn(command, args, config); children.push(child); return child;
+    } };
+    await Promise.all([ensureWorker(dir, options), ensureWorker(dir, options)]);
+    assert.equal(getJob(dir, first.id).status, 'running');
+    assert.ok(existsSync(join(dir, 'worker.next.lock')));
+    const replacement = await import('yaml');
+    const next = replacement.default.parse(readFileSync(join(dir, 'worker.next.lock'), 'utf8'));
+    assert.equal(children.filter(c => c.pid === next.pid).length, 1);
+  } finally {
+    release?.(); await old.catch(() => {}); stop.abort();
+    for (const child of children) if (child.exitCode === null && child.signalCode === null) {
+      child.ref(); const closed = once(child, 'close'); child.kill('SIGTERM'); await closed;
+    }
+  }
+});
+
+test('replacement lost during drain makes old resume without aborting its active job', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-lost-replacement-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'store');
+  const request = prompt => ({ runner: 'agent', prompt, lifetime: 'independent' });
+  const held = admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root, request: request('held') });
+  let release, calls = 0;
+  const stop = new AbortController();
+  const old = runWorker({ storeDir: dir, pollMs: 5, signal: stop.signal, runners: {
+    agent: async job => { calls++; if (job.id === held.id) await new Promise(resolve => { release = resolve; }); return {}; },
+  } });
+  let replacement;
+  try {
+    await until(() => getJob(dir, held.id).status === 'running');
+    const lock = join(dir, 'worker.lock');
+    writeFileSync(lock, readFileSync(lock, 'utf8').replace(/buildId: .*/, 'buildId: older-build'));
+    await ensureWorker(dir, { spawnWorker: (command, args, config) => { replacement = spawn(command, args, config); return replacement; }, timeoutMs: 4000 });
+    replacement.ref();
+    const closed = once(replacement, 'close');
+    replacement.kill('SIGKILL');
+    await closed;
+    await until(() => !existsSync(join(dir, 'worker.handoff')), 3000);
+    const next = admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root, request: request('old resumed') });
+    await until(() => getJob(dir, next.id).status === 'succeeded');
+    assert.equal(getJob(dir, held.id).status, 'running');
+    assert.equal(calls, 2);
+  } finally { release?.(); stop.abort(); await old.catch(() => {}); }
+});
+
+test('failed replacement retries only dead candidates and leaves old scheduler serving', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-retry-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'store');
+  const request = prompt => ({ runner: 'agent', prompt, lifetime: 'independent' });
+  const first = admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root, request: request('held') });
+  let release;
+  const stop = new AbortController();
+  const old = runWorker({ storeDir: dir, pollMs: 5, signal: stop.signal, runners: { agent: async job => {
+    if (job.id === first.id) await new Promise(resolve => { release = resolve; });
+    return { summary: 'served by old' };
+  } } });
+  try {
+    await until(() => getJob(dir, first.id).status === 'running');
+    const lock = join(dir, 'worker.lock');
+    writeFileSync(lock, readFileSync(lock, 'utf8').replace(/buildId: .*/, 'buildId: old-build'));
+    let attempts = 0;
+    await assert.rejects(ensureWorker(dir, { retries: 1, timeoutMs: 1500, spawnWorker: () => {
+      attempts++;
+      return spawn(process.execPath, ['-e', 'process.exit(17)'], { stdio: 'ignore' });
+    } }), /after 2 attempts.*exited.*worker.log/);
+    assert.equal(attempts, 2);
+    const second = admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root, request: request('still served') });
+    await until(() => getJob(dir, second.id).status === 'succeeded');
+    assert.equal(getJob(dir, first.id).status, 'running');
+    assert.equal(existsSync(join(dir, 'worker.next.lock')), false);
+  } finally { release?.(); stop.abort(); await old; }
+});
+
+test('old workflow children continue after handoff and replacement owns new roots', async t => {
+  const root = mkdtempSync(join(tmpdir(), 'wrk-rolling-child-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const dir = join(root, 'store');
+  const request = (runner, prompt) => ({ runner, prompt, lifetime: 'independent', options: runner === 'shell' ? { command: 'printf ready' } : {} });
+  const parent = admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root, request: request('router', 'parent') });
+  let releaseParent, childRuns = 0;
+  const stop = new AbortController();
+  const old = runWorker({ storeDir: dir, pollMs: 5, concurrency: 3, signal: stop.signal, runners: {
+    router: async (_, { submitChild, getChild }) => {
+      await new Promise(resolve => { releaseParent = resolve; });
+      const child = submitChild(request('agent', 'child'));
+      return { summary: (await getChild(child.id)).summary };
+    },
+    agent: async () => { childRuns++; return { summary: 'old child' }; },
+  } });
+  let replacement;
+  try {
+    await until(() => getJob(dir, parent.id).status === 'routing');
+    const lock = join(dir, 'worker.lock');
+    writeFileSync(lock, readFileSync(lock, 'utf8').replace(/buildId: .*/, 'buildId: old-build'));
+    await ensureWorker(dir, { spawnWorker: (command, args, options) => { replacement = spawn(command, args, options); return replacement; }, timeoutMs: 4000 });
+    const newRoot = admitJob(dir, { ownerId: 'owner', projectRoot: root, cwd: root, request: request('shell', 'new root') });
+    await until(() => getJob(dir, newRoot.id).status === 'succeeded', 3000);
+    releaseParent();
+    await until(() => getJob(dir, parent.id).status === 'succeeded', 3000);
+    await old;
+    assert.equal(childRuns, 1);
+    assert.equal(getJob(dir, parent.id).summary, 'old child');
+  } finally {
+    releaseParent?.(); stop.abort(); await old.catch(() => {});
+    if (replacement?.exitCode === null && replacement.signalCode === null) { replacement.ref(); const closed = once(replacement, 'close'); replacement.kill('SIGTERM'); await closed; }
+  }
+});
+
 test('notice failure cannot overwrite successful runner outcome', async () => {
   const f = fixture([{ id: 'job' }]);
   f.store.writeNotice = () => { throw new Error('notice unavailable'); };

@@ -7,6 +7,7 @@ import { StringDecoder } from 'node:string_decoder';
 import YAML from 'yaml';
 import { integrateSwarm } from './workspaces.mjs';
 import { formatFocus, normalizeFocus } from './focus.mjs';
+import { withConversationSession } from './conversation.mjs';
 
 const CAP = 1024 * 1024;
 const abortError = () => new Error('job cancelled');
@@ -130,14 +131,17 @@ function completed(result) {
 
 function installedDefinitions(cwd) {
   const definitions = {};
-  for (const dir of [join(homedir(), '.pi/agent/agents'), join(cwd, '.pi/agents')]) {
+  for (const dir of [join(homedir(), '.pi/agent/agents'),
+    ...(process.env.PI_CODING_AGENT_DIR ? [join(process.env.PI_CODING_AGENT_DIR, 'agents')] : []),
+    join(cwd, '.pi/agents')]) {
     if (!existsSync(dir)) continue;
     for (const name of readdirSync(dir).filter(n => n.endsWith('.md'))) {
       const source = readFileSync(join(dir, name), 'utf8');
       const match = /^---\r?\n([\s\S]*?)\r?\n---\r?\n([\s\S]*)$/.exec(source);
       if (!match) continue;
       const data = YAML.parse(match[1]);
-      if (typeof data?.name === 'string') definitions[data.name] = { ...data, prompt: match[2] };
+      const agentName = typeof data?.name === 'string' ? data.name : name.slice(0, -3);
+      if (agentName) definitions[agentName] = { ...data, prompt: match[2] };
     }
   }
   return definitions;
@@ -156,8 +160,8 @@ export function createRunners({ piCommand = 'pi', definitions, availableModels, 
     if (options.name && !selected) throw new Error(`unknown agent: ${options.name}`);
     const model = options.model ?? selected?.model ?? options.defaultModel;
     const models = model ? (availableModels ?? installedModels(piCommand)) : availableModels;
-    if (model && !models.includes(model)) throw new Error(`unknown model: ${model}`);
-    const args = ['--mode', 'json', '--no-extensions', '--no-session', '--offline'];
+    if (model && !models.includes(model)) throw new Error(`unknown model: ${model}; use a provider/model from pi --offline --list-models`);
+    const args = ['--mode', 'json', '--no-extensions', '--offline'];
     const focus = normalizeFocus(job.focus);
     const env = context.storeDir ? { ...process.env, PI_WRK_STORE: context.storeDir, PI_WRK_JOB_ID: job.id, ...(job.name ? { PI_WRK_JOB_NAME: job.name } : {}) } : undefined;
     if (focus?.mode === 'active') {
@@ -188,7 +192,8 @@ export function createRunners({ piCommand = 'pi', definitions, availableModels, 
       context.emit?.(`Model attempt: ${attempted.at(-1)}\n`);
       const runArgs = candidate ? [...args.slice(0, -2), '--model', candidate, ...args.slice(-2)] : args;
       try {
-        const summary = completed(await invoke(piCommand, runArgs, { cwd: job.cwd, signal: context.signal, emit: context.emit, env }));
+        const summary = completed(await withConversationSession(job.request.conversation, job.cwd, sessionArgs =>
+          invoke(piCommand, [...sessionArgs, ...runArgs], { cwd: job.cwd, signal: context.signal, emit: context.emit, env })));
         if (context.signal?.aborted) throw abortError();
         return { summary, output: summary, attemptedModels: attempted };
       } catch (error) {
