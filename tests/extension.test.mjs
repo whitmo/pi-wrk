@@ -8,11 +8,11 @@ import * as store from '../src/store.mjs';
 
 const { createExtension } = await createJiti(import.meta.url).import('../extensions/index.ts');
 
-function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure } = {}) {
+function harness({ startup = () => Promise.resolve(), parser, realStore, outputFailure, readZellijTab, zellijSessionName, zellijPaneId, collectFileMessages, initialBranch, sharedJobs, cleanupAt7Workspace, admissionFailure, delayTranscript = false } = {}) {
   const commands = new Map();
   const events = new Map();
   const bus = new Map();
-  const jobs = new Map();
+  const jobs = sharedJobs ?? new Map();
   const output = new Map();
   const notices = [];
   const ui = [];
@@ -22,7 +22,10 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
   let aborted = 0;
   let starts = 0;
   let heartbeat;
-  const branch = [{ id: 'prompt-1', type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'Unfinished request' }] } }];
+  let watchTick;
+  const messages = [];
+  const transcript = [];
+  const branch = initialBranch ?? [{ id: 'prompt-1', type: 'message', message: { role: 'user', content: [{ type: 'text', text: 'Unfinished request' }] } }];
   const ctx = {
     cwd: '/project', mode: 'tui', hasUI: true,
     ui: { notify: (message, type) => ui.push({ message, type }), setStatus: (key, value) => ui.push({ key, value }) },
@@ -35,6 +38,7 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
     parseRequest: parser ?? ((text, { alias }) => ({ runner: alias === '&' ? 'router' : 'agent', prompt: text.trim(), options: {}, queue: null, lifetime: 'session', handoff: !text.trim() })),
     storePath: () => '/project/.agents/wrk',
     admitJob: (_, input) => {
+      if (admissionFailure) throw new Error(admissionFailure);
       const job = { id: `job-${++serial}`, status: input.initialStatus ?? 'queued', ...input };
       jobs.set(job.id, job);
       return job;
@@ -54,20 +58,401 @@ function harness({ startup = () => Promise.resolve(), parser, realStore, outputF
     closeOwner: (_, id) => ui.push({ closed: id }),
     ensureWorker: () => { starts++; return startup(); },
     projectRoot: () => '/project',
-    setInterval: (callback) => { heartbeat = callback; return { unref() {} }; },
-    clearInterval: () => {},
+    setInterval: (callback, ms) => {
+      const timer = { cleared: false, unref() {} };
+      const tick = () => { if (!timer.cleared) callback(); };
+      if (ms === 5000) heartbeat = tick;
+      if (ms === 1000) watchTick = tick;
+      return timer;
+    },
+    clearInterval: (timer) => { timer.cleared = true; },
     newOwnerId: () => `owner-${owner}`,
+    readZellijTab: readZellijTab ?? (async () => { throw new Error('No Zellij test fixture'); }),
+    zellijSessionName: zellijSessionName ?? (() => 'agent-zellij'),
+    zellijPaneId: zellijPaneId ?? (() => 42),
+    collectFileMessages: collectFileMessages ?? (async () => []),
+    createAt7Workspace: () => ({ projectRoot: '/triage', cwd: '/triage', branch: 'wrk/at7-test' }),
+    cleanupAt7Workspace: cleanupAt7Workspace ?? (() => true),
   };
   if (realStore) Object.assign(deps, store, { storePath: () => realStore });
-  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), on: (name, handler) => events.set(name, handler), events: { emit: (name, payload) => bus.get(name)?.(payload) } };
+  const pi = { registerCommand: (name, config) => commands.set(name, config.handler), on: (name, handler) => events.set(name, handler), events: { emit: (name, payload) => bus.get(name)?.(payload) }, sendUserMessage: (message, options) => messages.push({ message, options }), appendEntry: (customType, data) => branch.push({ id: `entry-${branch.length}`, type: 'custom', customType, data }), sendMessage: (message, options) => { transcript.push({ message, options }); if (!delayTranscript) branch.push({ type: 'message', message: { role: 'custom', ...message } }); } };
   createExtension(pi, deps);
   const command = (name, input = '') => commands.get(name)(input, ctx);
   const event = (name, payload = {}, context = ctx) => events.get(name)?.(payload, context);
-  return { command, event, onBus: (name, handler) => bus.set(name, handler), ctx, jobs, ui, branch, notices, tick: () => heartbeat?.(), get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
+  return { command, event, onBus: (name, handler) => bus.set(name, handler), ctx, jobs, ui, branch, notices, messages, transcript, tick: () => heartbeat?.(), tickWatch: async () => { watchTick?.(); await flush(); }, get starts() { return starts; }, get aborted() { return aborted; }, busy: (value) => { busy = value; }, session: (value) => { owner = value; } };
 }
 
 
 const flush = () => new Promise(resolve => setImmediate(resolve));
+
+test('next turn admits one @@7 job per key; reload and repeat keep it seen', async () => {
+  const item = { key: 'file:test:1:question', source: 'file', location: 'test.ts:1', text: 'question?' };
+  const scopes = [];
+  const collect = async (root, scope) => { assert.equal(root, '/project'); scopes.push(scope); return [item]; };
+  const h = harness({ collectFileMessages: collect });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'ordinary request' });
+  assert.equal(h.jobs.size, 1);
+  const job = [...h.jobs.values()][0];
+  assert.equal(job.ownerId, 'owner-session-1');
+  assert.equal(job.cwd, '/triage');
+  assert.equal(job.projectRoot, '/triage');
+  assert.match(job.request.prompt, /test.ts:1[\s\S]*question\?/);
+  assert.match(job.request.prompt, /dirty|uncommitted/i);
+  assert.match(job.request.prompt, /worktree/i);
+  await h.event('before_agent_start', { prompt: 'another request' });
+  assert.equal(h.jobs.size, 1);
+  const reload = harness({ collectFileMessages: collect, initialBranch: h.branch });
+  await reload.event('session_start');
+  await reload.event('before_agent_start', { prompt: 'after reload' });
+  assert.equal(reload.jobs.size, 0);
+  await reload.command('wrk', 'at7 scan --all');
+  assert.equal(reload.jobs.size, 0);
+  assert.deepEqual(scopes, ['changed', 'changed', 'changed', 'all']);
+});
+
+test('failed bash new-tab never makes an unrelated tab eligible', async () => {
+  const reads = [];
+  const h = harness({ readZellijTab: async (_, selector) => { reads.push(selector); return { tabId: 2, snapshot: '@@7 unrelated' }; } });
+  await h.event('session_start');
+  const input = { command: 'zellij action new-tab --name existing' };
+  await h.event('tool_call', { toolName: 'bash', input });
+  await h.event('tool_result', { toolName: 'bash', input, isError: true });
+  await h.event('tool_result', { toolName: 'bash', input: { command: 'zellij action new-tab --name existing-too' }, details: { exitCode: 1 }, isError: false });
+  await h.event('before_agent_start', { prompt: 'continue' });
+  assert.deepEqual(reads, []);
+  assert.equal(h.jobs.size, 0);
+});
+
+test('successful named Zellij tools register created tabs, but non-tab placement does not', async () => {
+  const reads = [];
+  const h = harness({ readZellijTab: async (_, selector) => { reads.push(selector.tabName); return { tabId: reads.length, snapshot: '@@7 from tool' }; } });
+  await h.event('session_start');
+  await h.event('tool_result', { toolName: 'zellij_open_terminal', input: { placement: 'tab', tab_name: 'build' }, isError: false });
+  await h.event('tool_result', { toolName: 'zellij_start_pi', input: { placement: 'pane', tab_name: 'ignored' }, details: { tab_name: 'ignored' }, isError: false });
+  await h.event('tool_result', { toolName: 'zellij_start_pi', input: { placement: 'tab' }, details: { tab_name: 'remote', session_name: 'other-session' }, isError: false });
+  await h.event('before_agent_start', { prompt: 'continue' });
+  assert.deepEqual(reads, ['build']);
+  assert.equal(h.jobs.size, 1);
+});
+
+test('zellij_start_pi tab result registers named tabs and an existing-tab result baselines', async () => {
+  const screens = { pi: '@@7 pi ready', existing: '@@7 old\n' };
+  const reads = [];
+  const h = harness({ readZellijTab: async (_, selector) => { const name = selector.tabName ?? (selector.tabId === 1 ? 'pi' : 'existing'); reads.push(name); return { tabId: name === 'pi' ? 1 : 2, snapshot: screens[name] }; } });
+  await h.event('session_start');
+  await h.event('tool_result', { toolName: 'zellij_start_pi', input: { placement: 'tab' }, details: { tab_name: 'pi' }, isError: false });
+  await h.event('tool_result', { toolName: 'zellij_open_terminal', input: { placement: 'tab' }, details: { tab_name: 'existing', created: false }, isError: false });
+  screens.existing += '@@7 new\n';
+  await h.event('before_agent_start', { prompt: 'continue' });
+  assert.deepEqual([...h.jobs.values()].map(job => job.request.prompt.match(/pi ready|new/)[0]), ['pi ready', 'new']);
+  assert.deepEqual(reads, ['existing', 'pi', 'existing']);
+});
+
+test('Pi-mediated Zellij commands with an explicit session still identify named tabs', async () => {
+  const h = harness({ readZellijTab: async () => ({ tabId: 2, snapshot: '@@7 session option' }) });
+  await h.event('session_start');
+  await h.event('tool_call', { toolName: 'bash', input: { command: 'zellij --session agent-zellij action new-tab --name build' } });
+  await h.event('tool_result', { toolName: 'bash', input: { command: 'zellij --session agent-zellij action new-tab --name build' }, isError: false });
+  await h.event('before_agent_start', { prompt: 'continue' });
+  assert.equal(h.jobs.size, 1);
+  await h.event('tool_call', { toolName: 'bash', input: { command: 'zellij --session someone-else action new-tab --name other' } });
+  await h.event('before_agent_start', { prompt: 'again' });
+  assert.equal(h.jobs.size, 1);
+});
+
+test('terminal intake never scans when the owning Pi pane is unidentified', async () => {
+  const h = harness({ zellijPaneId: () => undefined, readZellijTab: async () => ({ tabId: 2, snapshot: '@@7 private Pi pane' }) });
+  await h.event('session_start');
+  await h.event('tool_call', { toolName: 'bash', input: { command: 'zellij action new-tab --name candidate' } });
+  await h.event('tool_result', { toolName: 'bash', input: { command: 'zellij action new-tab --name candidate' }, isError: false });
+  await h.event('before_agent_start', { prompt: 'ordinary' });
+  assert.equal(h.jobs.size, 0);
+});
+
+test('tool-created eligible tab is scanned on next turn; unrelated selected tab is never read', async () => {
+  const reads = [];
+  const h = harness({ readZellijTab: async (_, selector) => { reads.push(selector.tabName); return { tabId: 2, snapshot: '@@7 terminal ask' }; } });
+  await h.event('session_start');
+  await h.event('tool_call', { toolName: 'bash', input: { command: 'zellij action new-tab --name build' } });
+  await h.event('tool_result', { toolName: 'bash', input: { command: 'zellij action new-tab --name build' }, isError: false });
+  await h.event('before_agent_start', { prompt: 'look' });
+  assert.equal(h.jobs.size, 1);
+  assert.deepEqual(reads, ['build']);
+  assert.match([...h.jobs.values()][0].request.prompt, /terminal ask/);
+});
+
+test('independent @@7 job survives same-session reload, reports once and never redispatches', async () => {
+  const item = { key: 'key-persist', source: 'file', location: 'src/a.ts:1', text: 'question' };
+  const collect = async () => [item];
+  const h = harness({ collectFileMessages: collect });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'first' });
+  const job = [...h.jobs.values()][0];
+  assert.equal(job.request.lifetime, 'independent');
+  assert.equal(h.branch.some(entry => entry.customType === 'wrk-at7-journal' && entry.data?.jobId === job.id), true);
+  const reload = harness({ collectFileMessages: collect, initialBranch: h.branch, sharedJobs: h.jobs });
+  await reload.event('session_start');
+  job.status = 'succeeded'; job.summary = 'answered across reload';
+  reload.tick();
+  assert.equal(reload.transcript.length, 1);
+  assert.match(reload.transcript[0].message.content, /answered across reload/);
+  assert.equal(reload.transcript[0].options.triggerTurn, false);
+  await reload.event('before_agent_start', { prompt: 'again' });
+  assert.equal(reload.jobs.size, 1);
+  const next = harness({ collectFileMessages: collect, initialBranch: reload.branch, sharedJobs: reload.jobs });
+  await next.event('session_start');
+  next.tick();
+  assert.equal(next.transcript.length, 0);
+  await next.event('before_agent_start', { prompt: 'again' });
+  assert.equal(next.jobs.size, 1);
+});
+
+test('deferred transcript result is never marked delivered until the message is persisted', async () => {
+  const item = { key: 'deferred', source: 'file', location: 'a:1', text: 'help' };
+  const collect = async () => [item];
+  const h = harness({ collectFileMessages: collect, delayTranscript: true });
+  await h.event('session_start'); await h.event('before_agent_start', { prompt: 'request' });
+  const job = [...h.jobs.values()][0]; job.status = 'succeeded'; job.summary = 'answered';
+  h.tick(); h.tick();
+  assert.equal(h.transcript.length, 1);
+  assert.equal(h.branch.some(entry => entry.customType === 'wrk-at7-journal' && entry.data?.state === 'delivered'), false);
+  const reload = harness({ initialBranch: h.branch, sharedJobs: h.jobs, collectFileMessages: collect });
+  await reload.event('session_start'); reload.tick();
+  assert.equal(reload.transcript.length, 1);
+});
+
+test('reload recognizes an already-persisted transcript result even if its delivered journal entry was interrupted', async () => {
+  const h = harness({ collectFileMessages: async () => [{ key: 'interrupted-delivery', source: 'file', location: 'a:1', text: 'help' }] });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'request' });
+  const job = [...h.jobs.values()][0];
+  job.status = 'succeeded'; job.summary = 'answered';
+  h.branch.push({ type: 'message', message: { role: 'custom', customType: 'wrk-at7', details: { jobId: job.id } } });
+  const reload = harness({ initialBranch: h.branch, sharedJobs: h.jobs });
+  await reload.event('session_start');
+  reload.tick();
+  assert.equal(reload.transcript.length, 0);
+  assert.equal(reload.branch.some(entry => entry.customType === 'wrk-at7-journal' && entry.data?.state === 'cleaned'), true);
+});
+
+test('failed independent triage after reload reports error once without an old-owner notice', async () => {
+  const item = { key: 'failure-reload', source: 'file', location: 'a:1', text: 'help' };
+  const collect = async () => [item];
+  const h = harness({ collectFileMessages: collect });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'first' });
+  const reload = harness({ initialBranch: h.branch, sharedJobs: h.jobs, collectFileMessages: collect });
+  await reload.event('session_start');
+  const job = [...reload.jobs.values()][0];
+  job.status = 'failed'; job.error = 'triage failed';
+  reload.tick(); reload.tick();
+  assert.equal(reload.transcript.length, 1);
+  assert.match(reload.transcript[0].message.content, /triage failed/);
+  assert.equal(reload.transcript[0].options.triggerTurn, false);
+});
+
+test('failed admission cleans its unused worktree and leaves message unseen', async () => {
+  const cleaned = [];
+  const h = harness({ admissionFailure: 'store unavailable', collectFileMessages: async () => [{ key: 'retry', source: 'file', location: 'a:1', text: 'retry me' }], cleanupAt7Workspace: (root, path) => { cleaned.push([root, path]); return true; } });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'request' });
+  assert.deepEqual(cleaned, [['/project', '/triage']]);
+  assert.equal(h.branch.some(entry => entry.customType === 'wrk-at7-journal'), false);
+  assert.equal(h.ui.some(entry => /store unavailable/.test(entry.message ?? '')), true);
+});
+
+test('finished @@7 jobs clean idle worktrees once, but preserve dirty worktrees', async () => {
+  const item = { key: 'k-cleanup', source: 'file', location: 'a:1', text: 'action' };
+  const cleaned = [];
+  const h = harness({ collectFileMessages: async () => [item], cleanupAt7Workspace: (root, path) => { cleaned.push([root, path]); return false; } });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'request' });
+  const job = [...h.jobs.values()][0];
+  h.tick(); assert.deepEqual(cleaned, []); // running/queued jobs cannot lose their worktrees
+  job.status = 'failed'; job.error = 'triage unavailable';
+  h.tick(); h.tick();
+  assert.deepEqual(cleaned, [['/project', '/triage']]);
+  assert.match(h.transcript[0].message.content, /triage unavailable/);
+  assert.equal(h.ui.some(entry => /retained.*uncommitted/.test(entry.message ?? '')), true);
+});
+
+test('session switch during async collection drops old intake without recording seen', async () => {
+  let release;
+  const slow = new Promise(resolve => { release = resolve; });
+  let collecting = false;
+  const h = harness({ collectFileMessages: async () => { collecting = true; await slow; return [{ key: 'k', source: 'file', location: 'a:1', text: 'ask' }]; } });
+  await h.event('session_start');
+  const first = h.event('before_agent_start', { prompt: 'first' });
+  assert.equal(collecting, true);
+  h.session('other');
+  await h.event('session_start');
+  release(); await first;
+  assert.equal(h.jobs.size, 0);
+  assert.equal(h.branch.some(entry => entry.customType === 'wrk-at7-seen'), false);
+});
+
+test('triage notice displays bounded success or failure in transcript without waking the agent', async () => {
+  const item = { key: 'k', source: 'file', location: 'a:1', text: 'ask' };
+  const h = harness({ collectFileMessages: async () => [item] });
+  await h.event('session_start');
+  await h.event('before_agent_start', { prompt: 'request' });
+  const job = [...h.jobs.values()][0];
+  h.jobs.get(job.id).status = 'succeeded';
+  h.jobs.get(job.id).summary = 'answered the question';
+  h.notices.push({ id: 'note-1', jobId: job.id, message: 'completed', kind: 'succeeded' });
+  h.tick();
+  assert.equal(h.transcript.length, 1);
+  assert.equal(h.transcript[0].options.triggerTurn, false);
+  assert.match(h.transcript[0].message.content, /answered the question/);
+  assert.equal(h.messages.length, 0);
+  h.tick(); assert.equal(h.transcript.length, 1);
+  h.notices.push({ id: 'note-2', jobId: job.id, message: 'failed to act', kind: 'failed' });
+  h.tick(); assert.equal(h.transcript.length, 1);
+  const reload = harness({ initialBranch: h.branch });
+  await reload.event('session_start');
+  reload.jobs.set(job.id, job);
+  reload.notices.push({ id: 'note-reload', jobId: job.id, message: 'result retained', kind: 'succeeded' });
+  reload.tick();
+  assert.equal(reload.transcript.length, 0);
+});
+
+test('explicit visit baselines immediately, so output arriving before next turn is delivered', async () => {
+  let screen = '@@7 old';
+  const h = harness({ readZellijTab: async () => ({ tabId: 9, snapshot: screen }) });
+  await h.event('session_start');
+  await h.command('wrk', 'at7 tab my-tab');
+  screen += '\n@@7 after visit';
+  await h.event('before_agent_start', { prompt: 'continue' });
+  assert.equal(h.jobs.size, 1);
+  assert.match([...h.jobs.values()][0].request.prompt, /after visit/);
+});
+
+test('Pi-mediated tab visit baselines at completed tool call', async () => {
+  let screen = '@@7 old';
+  const h = harness({ readZellijTab: async () => ({ tabId: 9, snapshot: screen }) });
+  await h.event('session_start');
+  await h.event('tool_call', { toolName: 'bash', input: { command: 'zellij action go-to-tab-name visited' } });
+  await h.event('tool_result', { toolName: 'bash', input: { command: 'zellij action go-to-tab-name visited' }, isError: false });
+  screen += '\n@@7 next';
+  await h.event('before_agent_start', { prompt: 'continue' });
+  assert.equal(h.jobs.size, 1);
+  assert.match([...h.jobs.values()][0].request.prompt, /next/);
+});
+
+test('file messages still admit when a registered tab fails to read', async () => {
+  const item = { key: 'file:question', source: 'file', location: 'a:1', text: 'answer me' };
+  const h = harness({ collectFileMessages: async () => [item], readZellijTab: async () => { throw new Error('tab closed'); } });
+  await h.event('session_start');
+  await h.event('tool_call', { toolName: 'bash', input: { command: 'zellij action new-tab --name closed' } });
+  await h.event('tool_result', { toolName: 'bash', input: { command: 'zellij action new-tab --name closed' }, isError: false });
+  await h.event('before_agent_start', { prompt: 'continue' });
+  assert.equal(h.jobs.size, 1);
+  assert.match([...h.jobs.values()][0].request.prompt, /answer me/);
+  assert.equal(h.ui.some(entry => /tab closed/.test(entry.message ?? '')), true);
+});
+
+test('explicit at7 tab registration does not start a watch or wake an idle session', async () => {
+  const h = harness({ readZellijTab: async () => ({ tabId: 9, snapshot: '@@7 old' }) });
+  await h.event('session_start');
+  await h.command('wrk', 'at7 tab my-tab');
+  assert.match(h.ui.at(-1).message, /my-tab/);
+  assert.equal(h.messages.length, 0);
+  assert.equal(h.jobs.size, 0);
+});
+
+test('Zellij watch wakes once on a later tab screen change, not on unchanged polls', async () => {
+  let screen = 'initial';
+  const reads = [];
+  const h = harness({ readZellijTab: async (session, selection) => {
+    reads.push({ session, selection });
+    return { tabId: 9, snapshot: screen };
+  } });
+  await h.event('session_start');
+  await h.command('watch:zellij', 'term');
+  assert.match(h.ui.at(-1).message, /watching.*term/i);
+  assert.deepEqual(reads[0], { session: 'agent-zellij', selection: { tabName: 'term', ownPaneId: 42 } });
+  screen = 'fresh output before first poll';
+  h.busy(true); // streaming or compaction: do not lose an early wake
+  await h.tickWatch();
+  assert.equal(h.messages.length, 0);
+  h.busy(false);
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+  assert.match(h.messages[0].message, /term.*changed/i);
+  assert.equal(h.messages[0].options, undefined);
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+  assert.equal(reads.length, 2);
+});
+
+test('Zellij watch replacement, shutdown, and read failures do not wake stale sessions', async () => {
+  let screen = 'initial';
+  let error;
+  const h = harness({ readZellijTab: async (_, selection) => {
+    if (error) throw error;
+    return { tabId: selection.tabName === 'first' ? 1 : 2, snapshot: screen };
+  } });
+  await h.event('session_start');
+  await h.command('watch:zellij', 'first');
+  await h.command('watch:zellij', 'second');
+  await h.tickWatch(); // arm after replacement's receipt
+  screen = 'changed';
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+  assert.match(h.messages[0].message, /second/);
+  await h.command('watch:zellij', 'third');
+  h.session('session-2');
+  await h.event('session_start');
+  screen = 'changed again';
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+  await h.command('watch:zellij', 'fourth');
+  error = new Error('Zellij tab missing');
+  await h.tickWatch();
+  assert.match(h.ui.at(-1).message, /Zellij tab missing/);
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+  error = undefined;
+  await h.command('watch:zellij', 'fifth');
+  await h.event('session_shutdown');
+  screen = 'after shutdown';
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+});
+
+test('slow initial snapshot cannot replace a newer Zellij watch', async () => {
+  let finishFirst;
+  let screen = 'initial';
+  const h = harness({ readZellijTab: async (_, selection) => {
+    if (selection.tabName === 'first') return new Promise(resolve => { finishFirst = resolve; });
+    return { tabId: 2, snapshot: screen };
+  } });
+  await h.event('session_start');
+  const slow = h.command('watch:zellij', 'first');
+  await flush();
+  await h.command('watch:zellij', 'second');
+  finishFirst({ tabId: 1, snapshot: 'old screen' });
+  await slow;
+  await h.tickWatch();
+  screen = 'changed';
+  await h.tickWatch();
+  assert.equal(h.messages.length, 1);
+  assert.match(h.messages[0].message, /second/);
+});
+
+test('Zellij watch rejects invocation outside its owning Zellij session', async () => {
+  const h = harness({ zellijSessionName: () => '', readZellijTab: async () => ({ tabId: 1, snapshot: 'first' }) });
+  await h.event('session_start');
+  await h.command('watch:zellij', 'term');
+  assert.match(h.ui.at(-1).message, /Zellij session/i);
+  await h.tickWatch();
+  assert.equal(h.messages.length, 0);
+  const noPane = harness({ zellijPaneId: () => undefined, readZellijTab: async () => ({ tabId: 1, snapshot: 'first' }) });
+  await noPane.event('session_start');
+  await noPane.command('watch:zellij', 'term');
+  assert.match(noPane.ui.at(-1).message, /ZELLIJ_PANE_ID/);
+});
 
 test('BTW submission stays in the current session and publishes an inspectable answer', async () => {
   const h = harness();

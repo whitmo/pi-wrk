@@ -1,10 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, existsSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawnSync } from 'node:child_process';
-import { createSwarmWorkspaces, integrateSwarm } from '../src/workspaces.mjs';
+import { createAt7Workspace, cleanupAt7Workspace, createSwarmWorkspaces, integrateSwarm } from '../src/workspaces.mjs';
 
 const git = (cwd, ...args) => {
   const result = spawnSync('git', ['-c', 'commit.gpgsign=false', ...args], { cwd, encoding: 'utf8' });
@@ -26,6 +26,65 @@ function commit(workspace, name, content) {
   git(workspace.projectRoot, 'add', name);
   git(workspace.projectRoot, 'commit', '-qm', name);
 }
+
+test('@@7 triage gets its own worktree while the owner retains dirty files', t => {
+  const root = repo(t);
+  writeFileSync(join(root, 'base.txt'), 'dirty owner\n');
+  const space = createAt7Workspace(root, root);
+  assert.notEqual(space.projectRoot, root);
+  assert.match(space.branch, /^wrk\/at7-/);
+  assert.equal(readFileSync(join(space.projectRoot, 'base.txt'), 'utf8'), 'base\n');
+  commit(space, 'triage.txt', 'independent\n');
+  assert.equal(readFileSync(join(root, 'base.txt'), 'utf8'), 'dirty owner\n');
+  assert.equal(git(root, 'branch', '--show-current'), 'main');
+});
+
+test('terminal @@7 worktree removal keeps its commit branch and never edits shared exclude', t => {
+  const root = repo(t);
+  const exclude = git(root, 'rev-parse', '--git-path', 'info/exclude');
+  const before = readFileSync(join(root, exclude), 'utf8');
+  const space = createAt7Workspace(root, root);
+  assert.equal(readFileSync(join(root, exclude), 'utf8'), before);
+  commit(space, 'triage.txt', 'independent\n');
+  const head = git(space.projectRoot, 'rev-parse', 'HEAD');
+  assert.equal(cleanupAt7Workspace(root, space.projectRoot), true);
+  assert.equal(existsSync(space.projectRoot), false);
+  assert.equal(git(root, 'rev-parse', space.branch), head);
+});
+
+test('clean zero-commit @@7 cleanup removes both worktree and idle branch', t => {
+  const root = repo(t);
+  const space = createAt7Workspace(root, root);
+  assert.equal(cleanupAt7Workspace(root, space.projectRoot), true);
+  assert.equal(existsSync(space.projectRoot), false);
+  assert.equal(git(root, 'branch', '--list', space.branch), '');
+});
+
+test('zero-commit @@7 branch is removed even after owner advances', t => {
+  const root = repo(t);
+  const space = createAt7Workspace(root, root);
+  writeFileSync(join(root, 'owner.txt'), 'new owner work\n');
+  git(root, 'add', 'owner.txt'); git(root, 'commit', '-qm', 'owner work');
+  assert.equal(cleanupAt7Workspace(root, space.projectRoot, space.baseCommit), true);
+  assert.equal(git(root, 'branch', '--list', space.branch), '');
+});
+
+test('@@7 cleanup refuses dirty worktrees and preserves their files', t => {
+  const root = repo(t);
+  const space = createAt7Workspace(root, root);
+  writeFileSync(join(space.projectRoot, 'dirty.txt'), 'do not delete');
+  assert.equal(cleanupAt7Workspace(root, space.projectRoot), false);
+  assert.equal(readFileSync(join(space.projectRoot, 'dirty.txt'), 'utf8'), 'do not delete');
+});
+
+test('@@7 triage remains runnable when the owner works in an untracked subdirectory', t => {
+  const root = repo(t);
+  const subdir = join(root, 'new-dir');
+  mkdirSync(subdir);
+  writeFileSync(join(subdir, 'message.txt'), '# @@7 ask');
+  const space = createAt7Workspace(root, subdir);
+  assert.equal(space.cwd, space.projectRoot);
+});
 
 test('independent child commits combine in retained integration branch without changing original checkout', t => {
   const root = repo(t);
