@@ -1179,3 +1179,46 @@ test('first resolved recipient remains pinned if publication fails before ACK', 
   await h.event('before_agent_start', { prompt: 'name reused' });
   assert.equal(sent, 1, 'never attempt publication to a replacement name holder');
 });
+
+
+test('namespaced background pilot admits fresh and active-context tasks without short aliases', async t => {
+  const original = process.env.PI_WRK_NAMESPACED_ONLY;
+  process.env.PI_WRK_NAMESPACED_ONLY = '1';
+  t.after(() => {
+    if (original === undefined) delete process.env.PI_WRK_NAMESPACED_ONLY;
+    else process.env.PI_WRK_NAMESPACED_ONLY = original;
+  });
+  const h = harness({ parser: parseRequest });
+  h.ctx.sessionManager.buildSessionProjection = () => ({ entries: [
+    { sourceEntry: { type: 'message' }, messages: [{ role: 'user', content: [
+      { type: 'text', text: 'active user text' }, { type: 'image', data: 'secret image' },
+    ] }] },
+    { sourceEntry: { type: 'message' }, messages: [{ role: 'assistant', content: [
+      { type: 'text', text: 'active assistant text' }, { type: 'thinking', thinking: 'secret reasoning' },
+      { type: 'toolCall', name: 'read', arguments: { path: 'secret path' } },
+    ] }] },
+    { sourceEntry: { type: 'message' }, messages: [{ role: 'toolResult', content: 'secret output' }] },
+    { sourceEntry: { type: 'message', message: { role: 'user', content: 'redacted raw text' } }, messages: [] },
+    { sourceEntry: { type: 'branch_summary' }, messages: [{ role: 'user', content: 'abandoned branch' }] },
+  ] });
+  await h.event('session_start');
+  assert.deepEqual(await h.event('input', { text: '& other extension owns this', source: 'interactive' }), { action: 'continue' });
+  assert.throws(() => h.command('bg', 'other extension owns this'), TypeError);
+  await h.command('wrk', 'bg inspect fresh');
+  await h.command('wrk', 'bg + inspect inherited');
+  h.ctx.sessionManager.buildSessionProjection = () => { throw new Error('parent later changed'); };
+  const [fresh, inherited] = [...h.jobs.values()].map(job => job.request);
+  assert.equal(fresh.runner, 'agent');
+  assert.equal(fresh.prompt, 'inspect fresh');
+  assert.equal(fresh.conversation, undefined);
+  assert.equal(inherited.prompt, 'inspect inherited');
+  assert.deepEqual(inherited.conversation, [
+    { role: 'user', text: 'active user text' }, { role: 'assistant', text: 'active assistant text' },
+  ]);
+  await h.command('wrk', 'bg --lifetime independent');
+  assert.match(h.ui.at(-1).message, /Usage: \/wrk bg/);
+  assert.equal(h.aborted, 0);
+  await h.command('wrk', 'bg +');
+  assert.equal(h.jobs.size, 2);
+  assert.match(h.ui.at(-1).message, /Usage: \/wrk bg/);
+});

@@ -393,3 +393,35 @@ test('worker identity uses job label metadata without replacing explicit agent d
   assert.equal(calls[0].config.env.PI_WRK_JOB_NAME, 'act.rock.4');
   assert.ok(calls[0].args.includes('Review carefully'));
 });
+
+
+test('agent seeds an isolated temporary Pi session only when explicitly requested', async () => {
+  let seed;
+  let calls = 0;
+  const { agent } = createRunners({ invoke: async (_command, args) => {
+    ++calls;
+    assert.deepEqual(args.slice(-2), ['--', 'actual task']);
+    assert.ok(!args.includes('prior user text'));
+    if (calls === 1) {
+      assert.ok(args.includes('--no-session'));
+      assert.ok(!args.includes('--session'));
+    } else {
+      assert.ok(!args.includes('--no-session'));
+      seed = args[args.indexOf('--session') + 1];
+      const [header, user, assistant] = readFileSync(seed, 'utf8').trim().split('\n').map(JSON.parse);
+      assert.equal(header.type, 'session');
+      assert.equal(user.parentId, null);
+      assert.equal(user.message.content, 'prior user text');
+      assert.equal(assistant.parentId, user.id);
+      assert.deepEqual(assistant.message.content, [{ type: 'text', text: 'prior answer' }]);
+    }
+    return completion('done');
+  } });
+  const fresh = job('agent', 'actual task');
+  await agent(fresh, ctx());
+  await agent({ ...fresh, request: { ...fresh.request, conversation: [
+    { role: 'user', text: 'prior user text' }, { role: 'assistant', text: 'prior answer' },
+  ] } }, ctx());
+  assert.equal(calls, 2);
+  assert.throws(() => readFileSync(seed), { code: 'ENOENT' });
+});

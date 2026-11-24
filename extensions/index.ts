@@ -1,9 +1,10 @@
 import { randomUUID } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
-import type { ExtensionAPI } from '@earendil-works/pi-coding-agent';
+import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
 import { Type } from '@sinclair/typebox';
 import { captureFocus } from '../src/focus.mjs';
+import { captureConversation } from '../src/conversation.mjs';
 import { parseInput } from '../src/input-syntax.mjs';
 import { generateName, loadNameWords } from '../src/names.mjs';
 import { readTab, readTabScreen } from '../src/zellij-watch.mjs';
@@ -17,6 +18,7 @@ import type { At7Signal } from './at7-peers.ts';
 type Request = {
   runner: string;
   prompt: string;
+  conversation?: ReturnType<typeof captureConversation>;
   options: Record<string, unknown>;
   queue: string | null;
   lifetime: 'session' | 'independent';
@@ -41,6 +43,7 @@ type Job = {
 };
 type Session = {
   getSessionId(): string;
+  buildSessionProjection?: ExtensionContext['sessionManager']['buildSessionProjection'];
   getBranch(): Array<{ id: string; type: string; customType?: string; data?: unknown; message?: { role?: string; content?: unknown } }>;
 };
 type Context = {
@@ -104,6 +107,7 @@ function userText(content: unknown): string | undefined {
 
 /** Bind only Pi command/event handlers. External dependencies remain injectable for host-free tests. */
 export function createExtension(pi: Pi, deps: Dependencies, inboxAddress?: (ctx: Context) => string): void {
+  const namespacedOnly = process.env.PI_WRK_NAMESPACED_ONLY === '1';
   const words = loadNameWords(new URL('../docs/sorted_short_words.csv', import.meta.url));
   const generateWorkItemName = () => generateName(words);
   const display = (job: Job) => job.name ? `${job.name} ${job.id}` : job.id;
@@ -347,11 +351,19 @@ export function createExtension(pi: Pi, deps: Dependencies, inboxAddress?: (ctx:
       notify(ctx, error instanceof Error ? error.message : String(error), 'error');
     }
   }
-  async function submit(alias: string, args: string, ctx: Context, model?: string): Promise<{ job?: Job; error?: string }> {
+  async function submit(alias: string, args: string, ctx: Context, { model, requireTask }: { model?: string; requireTask?: boolean } = {}): Promise<{ job?: Job; error?: string }> {
     try {
       const session = current(ctx);
       if (!session) throw new Error('Session owner unavailable; retry after session start');
-      const request = deps.parseRequest(args, { alias });
+      const inherit = alias === 'bg' && /^\+(?:\s|$)/.test(args.trimStart());
+      const task = inherit ? args.trimStart().slice(1).trimStart() : args;
+      if (inherit && !task) throw new Error('Usage: /wrk bg + <task>');
+      const request = deps.parseRequest(task, { alias });
+      if (requireTask && request.handoff) throw new Error('Usage: /wrk bg [+] <task>');
+      if (inherit) {
+        if (request.runner !== 'agent' || request.handoff) throw new Error('Background context requires an explicit agent task');
+        request.conversation = captureConversation(ctx.sessionManager);
+      }
       if (model) request.options = { ...request.options, model };
       if (request.runner !== 'shell') request.options = {
         ...request.options,
@@ -402,6 +414,11 @@ export function createExtension(pi: Pi, deps: Dependencies, inboxAddress?: (ctx:
     const [verb, id, extra] = args.trim().split(/\s+/);
     const dir = session.dir;
     try {
+      if (verb === 'bg') {
+        if (!id) throw new Error('Usage: /wrk bg [+] <task>');
+        await submit('bg', args.trimStart().slice(2).trimStart(), ctx, { requireTask: true });
+        return;
+      }
       if (verb === 'inbox' && !id) { notify(ctx, inboxAddress?.(ctx) ?? 'File-in not configured', inboxAddress ? 'info' : 'warning'); return; }
       if (verb === 'at7' && id === 'scan') {
         if (extra !== '--all') throw new Error('Usage: /wrk at7 scan --all');
@@ -472,10 +489,12 @@ export function createExtension(pi: Pi, deps: Dependencies, inboxAddress?: (ctx:
       };
     },
   });
-  pi.registerCommand('&', { description: 'Submit work asynchronously', handler: async (args, ctx) => { await submit('&', args, ctx); } });
-  pi.registerCommand('bg', { description: 'Submit to a background agent', handler: async (args, ctx) => { await submit('bg', args, ctx); } });
-  for (const condition of ['&&', '||', '~&&', '~||'])
-    pi.registerCommand(condition, { description: `Submit conditional background job (${condition})`, handler: async (args, ctx) => { await submit(condition, args, ctx); } });
+  if (!namespacedOnly) {
+    pi.registerCommand('&', { description: 'Submit work asynchronously', handler: async (args, ctx) => { await submit('&', args, ctx); } });
+    pi.registerCommand('bg', { description: 'Submit to a background agent (+ to inherit conversation)', handler: async (args, ctx) => { await submit('bg', args, ctx); } });
+    for (const condition of ['&&', '||', '~&&', '~||'])
+      pi.registerCommand(condition, { description: `Submit conditional background job (${condition})`, handler: async (args, ctx) => { await submit(condition, args, ctx); } });
+  }
   pi.registerCommand('wrk', { description: 'Submit or inspect background jobs', handler: async (args, ctx) => manage(args, ctx) });
   pi.registerCommand('watch:zellij', { description: 'Wake once when a named tab changes', handler: async (args, ctx) => {
     stopWatch();
@@ -502,14 +521,14 @@ export function createExtension(pi: Pi, deps: Dependencies, inboxAddress?: (ctx:
   } });
 
   pi.on('input', async (event, ctx) => {
-    if (event.source === 'extension') return { action: 'continue' };
+    if (namespacedOnly || event.source === 'extension') return { action: 'continue' };
     try {
       // Pi expands skill commands only after input handlers; admit the raw task here.
       const skill = /^\/skill:wrk(?:\s+([\s\S]*))?$/.exec(event.text);
       const syntax = skill ? { alias: 'wrk', args: skill[1] ?? '', foreground: '' } : parseInput(event.text);
       if (!syntax) return { action: 'continue' };
       if (event.images?.length) throw new Error('Background input cannot include images');
-      if (!(await submit(syntax.alias, syntax.args, ctx, syntax.model)).job) return { action: 'handled' };
+      if (!(await submit(syntax.alias, syntax.args, ctx, { model: syntax.model })).job) return { action: 'handled' };
       return syntax.foreground ? { action: 'transform', text: syntax.foreground } : { action: 'handled' };
     } catch (error) {
       notify(ctx, error instanceof Error ? error.message : String(error), 'error');
