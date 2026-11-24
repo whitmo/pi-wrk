@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createJiti } from 'jiti';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import * as store from '../src/store.mjs';
@@ -1221,4 +1221,19 @@ test('namespaced background pilot admits fresh and active-context tasks without 
   await h.command('wrk', 'bg +');
   assert.equal(h.jobs.size, 2);
   assert.match(h.ui.at(-1).message, /Usage: \/wrk bg/);
+});
+
+
+test('checkout-local marker keeps short aliases with the existing owner', async t => {
+  const dir = mkdtempSync(join(tmpdir(), 'pi-wrk-mode-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  t.mock.method(process, 'cwd', () => dir);
+  mkdirSync(join(dir, '.pi'));
+  writeFileSync(join(dir, '.pi', 'pi-wrk-namespaced-only'), '');
+  const h = harness({ parser: parseRequest });
+  assert.throws(() => h.command('bg', 'do not launch'), TypeError);
+  assert.throws(() => h.command('&', 'do not launch'), TypeError);
+  await h.event('session_start');
+  await h.command('wrk', 'bg local pilot');
+  assert.equal(h.jobs.size, 1);
 });

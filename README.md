@@ -34,8 +34,10 @@ settings or reload a running session.
   Pi session is neither shared nor modified.
 - `/bg <prompt>` and `/bg + <prompt>` are shortcuts for those commands.
   To pilot under `/wrk` alongside another extension that owns `/bg` or `/&`,
-  set `PI_WRK_NAMESPACED_ONLY=1` before launching Pi. This disables pi-wrk's
-  short aliases and bare composer input interception, not `/wrk`.
+  create an empty `.pi/pi-wrk-namespaced-only` file in the directory where
+  Pi starts, or set `PI_WRK_NAMESPACED_ONLY=1` before launching Pi. This
+  disables pi-wrk's short aliases and bare composer input interception, not
+  `/wrk`.
 - `/& <prompt>` or `/wrk <prompt>`: route to an agent, council or swarm.
 - `/& a:{name: ari, model: provider/model} <prompt>`: explicit agent/model;
   unknown names and unavailable models fail rather than being ignored.

@@ -107,7 +107,8 @@ function userText(content: unknown): string | undefined {
 
 /** Bind only Pi command/event handlers. External dependencies remain injectable for host-free tests. */
 export function createExtension(pi: Pi, deps: Dependencies, inboxAddress?: (ctx: Context) => string): void {
-  const namespacedOnly = process.env.PI_WRK_NAMESPACED_ONLY === '1';
+  const namespacedOnly = process.env.PI_WRK_NAMESPACED_ONLY === '1'
+    || existsSync(join(process.cwd(), '.pi', 'pi-wrk-namespaced-only'));
   const words = loadNameWords(new URL('../docs/sorted_short_words.csv', import.meta.url));
   const generateWorkItemName = () => generateName(words);
   const display = (job: Job) => job.name ? `${job.name} ${job.id}` : job.id;
