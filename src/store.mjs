@@ -141,7 +141,7 @@ export function storePath(projectRoot) {
   return join(resolve(projectRoot), '.agents', 'wrk');
 }
 
-export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, handoff, parentId, focus } = {}) {
+export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, handoff, parentId, focus, initialStatus = 'queued' } = {}) {
   ownerId(owner);
   const parent = parentId !== undefined ? existingJob(storeDir, jobId(parentId)) : undefined;
   focus = normalizeFocus(parent ? parent.focus : focus);
@@ -151,6 +151,9 @@ export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, 
       typeof request.prompt !== 'string' || !['session', 'independent'].includes(request.lifetime))
     throw new Error('invalid request');
   if (handoff !== undefined) safeData(handoff);
+  if (initialStatus !== 'queued' && !(initialStatus === 'running' && request.runner === 'btw')) {
+    throw new Error('invalid initial status for runner');
+  }
   if (request.queue != null) {
     const name = queueName(request.queue);
     const path = location(storeDir, 'queues', `${name}.yaml`);
@@ -166,7 +169,7 @@ export function admitJob(storeDir, { request, ownerId: owner, projectRoot, cwd, 
   for (let attempt = 0; attempt < 5; attempt++) {
     const id = randomUUID();
     const job = { id, request, ownerId: owner, projectRoot: resolve(projectRoot), cwd: resolve(cwd),
-      status: 'queued', createdAt: now, updatedAt: now };
+      status: initialStatus, createdAt: now, updatedAt: now };
     if (focus !== undefined) job.focus = focus;
     if (handoff !== undefined) job.handoff = handoff;
     if (parentId !== undefined) job.parentId = parentId;

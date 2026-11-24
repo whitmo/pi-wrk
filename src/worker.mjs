@@ -184,7 +184,7 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
   }
   try {
     for (const job of store.listJobs(storeDir)) {
-      if (['running', 'routing'].includes(job.status)) {
+      if (job.request.runner !== 'btw' && ['running', 'routing'].includes(job.status)) {
         notice(update(job.id, { status: 'uncertain', error: 'worker restarted without verified runner identity; operator resolution required' }));
       }
     }
@@ -192,6 +192,14 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
       const jobs = store.listJobs(storeDir);
       for (const job of jobs) {
         if (terminal.has(job.status)) continue;
+        if (job.request.runner === 'btw') {
+          if (job.status === 'queued' || !store.ownerAlive(storeDir, job.ownerId, { leaseMs })) {
+            notice(update(job.id, { status: 'failed', error: job.status === 'queued'
+              ? 'BTW job was not claimed by its owning Pi session'
+              : 'Owning Pi session ended before BTW replied', finishedAt: new Date().toISOString() }));
+          }
+          continue;
+        }
         const parent = job.parentId && store.getJob(storeDir, job.parentId);
         const expired = job.request.lifetime !== 'independent' && !store.ownerAlive(storeDir, job.ownerId, { leaseMs });
         const requested = store.isCancelRequested(storeDir, job.id) || (parent && (terminal.has(parent.status) && parent.status !== 'succeeded' || store.isCancelRequested(storeDir, parent.id)));
@@ -200,7 +208,7 @@ export async function runWorker({ storeDir, pollMs = 100, leaseMs = 15000, concu
       }
       // Unknown mutations may still be active. Do not launch even unrelated work until resolved.
       if (store.listJobs(storeDir).some(j => j.status === 'uncertain')) { await delay(pollMs); continue; }
-      const queued = store.listJobs(storeDir).filter(j => j.status === 'queued' && (!j.handoff || j.handoff.ready === true));
+      const queued = store.listJobs(storeDir).filter(j => j.status === 'queued' && j.request.runner !== 'btw' && (!j.handoff || j.handoff.ready === true));
       const busyQueues = new Set([...active.keys()].map(id => store.getJob(storeDir, id).request.queue).filter(Boolean));
       for (const job of queued.reverse()) {
         if (occupiedSlots() >= concurrency) continue;
