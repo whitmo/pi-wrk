@@ -71,12 +71,29 @@ Do not delete the record or change its status just to unblock scheduling.
 If survivors cannot be identified confidently, leave the barrier in place.
 The original descendant-confirmation requirement remains unfinished.
 
-Readiness uses a token/socket handshake, not PID liveness. A recent stale
-lock waits through the startup grace period before reclamation. Lock data
-and job records are YAML under `.agents/wrk`. The transient Unix socket
-uses an ownership-checked private `/tmp/pi-wrk-<uid>/` directory with a
-hash of the absolute store path: macOS socket paths are too short for
-arbitrary checkout paths. Do not remove the socket while a worker owns it.
+Readiness uses a token/socket handshake, not PID liveness. A stale
+worker lock is reclaimed only after the recorded PID is proven dead and
+the startup grace period has passed; concurrent reclaimers serialize on
+`worker.reclaim.lock`. If ownership cannot be proved, stop and inspect
+`worker.log` rather than deleting the lock. A corrupt job record stops
+the scheduler instead of hiding possibly running work; active runners
+are aborted and awaited before worker ownership is released. Inspect the
+record and possible survivors before recovery. Lock data and job records
+are YAML under `.agents/wrk`. The transient Unix socket uses an
+ownership-checked private `/tmp/pi-wrk-<uid>/` directory with a hash of
+the absolute store path: macOS socket paths are too short for arbitrary
+checkout paths. Do not remove the socket while a worker owns it.
+
+## Conditional jobs
+
+`/&&` runs after the preceding root job in this Pi session succeeds;
+`/||` runs after it fails. `/~&&` and `/~||` require a durable semantic
+verdict explicitly reported by a worker-owned agent through
+`wrk_message`. No verdict means neither semantic edge runs. These are
+one-step dependencies, not automatic loops. For repeated check/fix work,
+set an attempt limit, rerun the predicate after each fix, and attach any
+deploy job to the *latest passing predicate*, not to the fix. Uncertain
+work blocks all new starts until an operator has inspected survivors.
 
 ## What still needs proof or a decision
 

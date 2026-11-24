@@ -5,13 +5,15 @@ description: Use when a user wants to move an unfinished request or a new task t
 
 # Background work
 
-For a new task, use `/bg <prompt>` directly. The command writes a job before
+For a new task, use `/bg <prompt>` directly. In interactive composer input,
+`& <prompt>` is equivalent to `/& <prompt>` (router-selected), while a line
+ending in ` &` backgrounds only that line. The command writes a job before
 returning a receipt; it does not send the prompt to the foreground model or
 wait for the worker. The default lifetime is `session`: closing the session
 cancels its jobs. Use `/bg --lifetime independent <prompt>` only when the
 job must survive the session.
 
-Bare `/bg` requests a handoff of the **currently unfinished** foreground
+Bare `/bg` or `&` requests a handoff of the **currently unfinished** foreground
 request. It is admitted blocked, aborts foreground activity, and becomes
 ready only after Pi confirms an aborted settlement. A completed request,
 a request with a tool call, or uncertain settlement stays refused or blocked

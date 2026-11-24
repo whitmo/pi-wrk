@@ -15,6 +15,8 @@ the foreground agent plan or execute the submitted prompt.
 | --- | --- |
 | `/& a:{name: ari, model: provider/model} <prompt>` | Named agent and model; unknown definitions fail |
 | `/& sh:{command: "npm test"}` | Explicit shell process in the submission cwd |
+| `/&& <task>` / `/|| <task>` | Run after the preceding root succeeds / fails |
+| `/~&& <task>` / `/~|| <task>` | Require an explicit agent semantic success / failure verdict |
 | `/& q:{name: review} <prompt>` | FIFO named queue; add an agent or shell selector after the queue if needed |
 | `/& council <prompt>` | Two independent read-only assessments, then synthesis |
 | `/& swarm <prompt>` | Two child assignments, then synthesis |
@@ -23,6 +25,12 @@ the foreground agent plan or execute the submitted prompt.
 | `/wrk` or `/wrk jobs` | List current project's jobs |
 | `/wrk status <id>` / `/wrk output <id>` | Inspect state, notices or bounded output |
 | `/wrk cancel <id>` | Request cancellation; check status for the final outcome |
+
+In composer input, leading `&`, `&&`, `||`, `~&&`, or `~||` works
+without `/`. A trailing ` &` backgrounds just that line; use
+`<& type=swarm model="provider/model"> task </&>` to mark one span.
+Only one background form is allowed per input. See `and-do`, `or-do`,
+and `until-true` for bounded logical workflows, not automatic loops.
 
 A leading `--lifetime independent` keeps a job alive after the submitting
 session closes; the default `session` lifetime uses a heartbeat lease,
