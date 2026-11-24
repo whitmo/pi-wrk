@@ -24,19 +24,23 @@
     ]
   },
   "dependencies": {
-    "@sinclair/typebox": "^0.34.52",
     "jiti": "^2.6.0",
     "yaml": "^2.8.1"
   },
   "devDependencies": {
+    "@sinclair/typebox": "^0.34.52",
     "@types/node": "^24.0.0",
     "typescript": "^5.9.0"
   },
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=1.0.0"
+    "@earendil-works/pi-coding-agent": ">=1.0.0",
+    "@sinclair/typebox": "*"
   },
   "peerDependenciesMeta": {
     "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@sinclair/typebox": {
       "optional": true
     }
   }
